@@ -50,36 +50,33 @@ fn init_logging() {
 fn main() -> eframe::Result<()> {
     init_logging();
 
-    let present_mode =
-        if let Some(present_mode_env_var) = std::env::var("RAPHAEL_PRESENT_MODE").ok() {
-            match present_mode_env_var.as_str() {
-                "AutoVsync" => eframe::wgpu::PresentMode::AutoVsync,
-                "AutoNoVsync" => eframe::wgpu::PresentMode::AutoNoVsync,
-                "Fifo" => eframe::wgpu::PresentMode::Fifo,
-                "FifoRelaxed" => eframe::wgpu::PresentMode::FifoRelaxed,
-                "Immediate" => eframe::wgpu::PresentMode::Immediate,
-                "Mailbox" => eframe::wgpu::PresentMode::Mailbox,
-                _ => panic!("Unknown present mode: {}", present_mode_env_var),
-            }
-        } else {
-            eframe::wgpu::PresentMode::default()
-        };
-    let desired_maximum_frame_latency = if let Some(desired_maximum_frame_latency_env_var) =
-        std::env::var("RAPHAEL_DESIRED_MAXIMUM_FRAME_LATENCY").ok()
-    {
-        match desired_maximum_frame_latency_env_var.parse() {
+    let present_mode = std::env::var("RAPHAEL_PRESENT_MODE").map_or(
+        eframe::wgpu::PresentMode::default(),
+        |env_var| match env_var.as_str() {
+            "AutoVsync" => eframe::wgpu::PresentMode::AutoVsync,
+            "AutoNoVsync" => eframe::wgpu::PresentMode::AutoNoVsync,
+            "Fifo" => eframe::wgpu::PresentMode::Fifo,
+            "FifoRelaxed" => eframe::wgpu::PresentMode::FifoRelaxed,
+            "Immediate" => eframe::wgpu::PresentMode::Immediate,
+            "Mailbox" => eframe::wgpu::PresentMode::Mailbox,
+            _ => panic!("Unknown present mode: {}", env_var),
+        },
+    );
+
+    let desired_maximum_frame_latency = std::env::var("RAPHAEL_DESIRED_MAXIMUM_FRAME_LATENCY")
+        .map_or(None, |env_var| match env_var.parse::<u32>() {
             Ok(value) => Some(value),
             Err(e) => panic!(
                 "Failed to parse desired maximum frame latency with error: {}",
                 e
             ),
-        }
-    } else {
-        None
-    };
+        });
+
     let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
-        present_mode,
-        desired_maximum_frame_latency,
+        surface: eframe::egui_wgpu::SurfaceConfig {
+            present_mode,
+            desired_maximum_frame_latency,
+        },
         ..Default::default()
     };
 
@@ -104,6 +101,7 @@ fn main() -> eframe::Result<()> {
 fn main() {
     fn custom_alloc_error_hook(_layout: std::alloc::Layout) {
         raphael_xiv::OOM_PANIC_OCCURED.store(true, std::sync::atomic::Ordering::Relaxed);
+        eframe::wasm_bindgen::throw_val("OOM panic".into());
     }
     std::alloc::set_alloc_error_hook(custom_alloc_error_hook);
 
@@ -136,14 +134,7 @@ fn main() {
             .await;
         remove_loading_spinner();
         if let Err(error) = start_result {
-            let mut message = format!("Failed to start app: {error:?}");
-            log::error!("{message}");
-            message.push_str("\n\nIn case the error is \"WebGL not supported\":");
-            message.push_str("\nPlease enable WebGL support in your browser.");
-            web_sys::window()
-                .unwrap()
-                .alert_with_message(&message)
-                .unwrap();
+            eframe::wasm_bindgen::throw_val(error);
         }
     });
 }

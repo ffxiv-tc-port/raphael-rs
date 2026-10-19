@@ -1,4 +1,4 @@
-use raphael_sim::{Action, ActionMask, Settings, SimulationState};
+use raphael_sim::{ActionMask, Settings, SimulationState};
 use raphael_solver::{AtomicFlag, MacroSolver, SolverSettings};
 
 fn main() {
@@ -8,22 +8,23 @@ fn main() {
         .init();
 
     let simulator_settings = Settings {
-        max_cp: 753,
-        max_durability: 20,
-        max_progress: 4700,
-        max_quality: 14900,
-        base_progress: 310,
-        base_quality: 324,
+        max_cp: 776,
+        max_durability: 70,
+        max_progress: 9700,
+        max_quality: 17300,
+        base_progress: 327,
+        base_quality: 336,
         job_level: 100,
-        allowed_actions: ActionMask::all()
-            .remove(Action::TrainedEye)
-            .remove(Action::HeartAndSoul)
-            .remove(Action::QuickInnovation),
+        allowed_actions: ActionMask::regular(),
         adversarial: false,
         backload_progress: false,
+        stellar_steady_hand_charges: 0,
     };
 
-    let solver_settings = SolverSettings { simulator_settings };
+    let solver_settings = SolverSettings {
+        simulator_settings,
+        allow_non_max_quality_solutions: false,
+    };
 
     let mut solver = MacroSolver::new(
         solver_settings,

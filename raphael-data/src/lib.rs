@@ -7,6 +7,8 @@ pub use config::*;
 mod locales;
 pub use locales::*;
 
+use non_contiguously_indexed_array::{NciArray, nci_array};
+
 mod search;
 pub use search::*;
 
@@ -18,7 +20,6 @@ pub const CL_ICON_CHAR: char = '\u{e03d}';
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Item {
     pub item_level: u16,
-    pub can_be_hq: bool,
     pub always_collectable: bool,
 }
 
@@ -68,10 +69,53 @@ pub struct Recipe {
     pub req_control: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(u8)]
+pub enum CosmicExplorationZone {
+    SinusArdorum,
+    Phaenna,
+    Oizys,
+    Auxesia,
+}
+
+impl CosmicExplorationZone {
+    pub fn from_mission_id(mission_id: u32) -> Self {
+        match mission_id {
+            ..545 => Self::SinusArdorum,
+            545..1040 => Self::Phaenna,
+            1040..1370 => Self::Oizys,
+            1370.. => Self::Auxesia,
+        }
+    }
+
+    pub fn from_zone_name(zone_name: &str, locale: Locale) -> Option<Self> {
+        [
+            Self::SinusArdorum,
+            Self::Phaenna,
+            Self::Oizys,
+            Self::Auxesia,
+        ]
+        .into_iter()
+        .find(|&zone| get_cosmic_exploration_zone_name(zone, locale) == zone_name)
+    }
+}
+
+#[derive(Debug)]
+pub struct StellarMission {
+    pub job_id: u8,
+    pub stellar_steady_hand_charges: u8,
+    pub recipe_ids: &'static [u32],
+}
+
 pub const RLVLS: &[RecipeLevel] = include!("../data/rlvls.rs");
 pub const LEVEL_ADJUST_TABLE: &[u16] = include!("../data/level_adjust_table.rs");
-pub static RECIPES: phf::OrderedMap<u32, Recipe> = include!("../data/recipes.rs");
-pub const ITEMS: phf::OrderedMap<u32, Item> = include!("../data/items.rs");
+pub const RECIPES: NciArray<u32, Recipe> = include!("../data/recipes.rs");
+pub const ITEMS: NciArray<u32, Item> = include!("../data/items.rs");
+
+pub const STELLAR_MISSIONS: NciArray<u32, StellarMission> = include!("../data/stellar_missions.rs");
+pub const RECIPE_TO_STELLAR_MISSION_LINKS: NciArray<u32, u32> =
+    include!("../data/recipe_to_stellar_mission_link.rs");
 
 pub fn get_game_settings(
     recipe: Recipe,
@@ -119,6 +163,7 @@ pub fn get_game_settings(
         allowed_actions = allowed_actions.remove(Action::QuickInnovation);
     }
 
+    #[allow(clippy::option_if_let_else)]
     match custom_recipe_overrides {
         Some(overrides) => Settings {
             max_cp: cp as _,
@@ -137,6 +182,7 @@ pub fn get_game_settings(
             allowed_actions,
             adversarial: false,
             backload_progress: false,
+            stellar_steady_hand_charges: 0,
         },
         None => Settings {
             max_cp: cp as _,
@@ -149,6 +195,7 @@ pub fn get_game_settings(
             allowed_actions,
             adversarial: false,
             backload_progress: false,
+            stellar_steady_hand_charges: 0,
         },
     }
 }
@@ -161,16 +208,14 @@ pub fn get_initial_quality(
     let ingredients: Vec<(Item, u32)> = recipe
         .ingredients
         .iter()
-        .filter_map(|ingredient| Some((*ITEMS.get(&ingredient.item_id)?, ingredient.amount)))
+        .filter_map(|ingredient| Some((*ITEMS.get(ingredient.item_id)?, ingredient.amount)))
         .collect();
 
     let mut max_ilvl = 0;
     let mut provided_ilvl = 0;
     for (index, (item, max_amount)) in ingredients.into_iter().enumerate() {
-        if item.can_be_hq {
-            max_ilvl += max_amount as u16 * item.item_level;
-            provided_ilvl += hq_ingredients[index] as u16 * item.item_level;
-        }
+        max_ilvl += max_amount as u16 * item.item_level;
+        provided_ilvl += hq_ingredients[index] as u16 * item.item_level;
     }
 
     let rlvl = if recipe.max_level_scaling != 0 {

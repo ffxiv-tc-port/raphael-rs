@@ -64,6 +64,10 @@ pub struct SolveArgs {
     #[arg(long, default_value_t = false)]
     pub quick_innovation: bool,
 
+    /// Set the maximum number of Stellar Steady Hand uses
+    #[arg(long)]
+    pub stellar_steady_hand: Option<u8>,
+
     /// Set initial quality, value is clamped to 100% quality
     #[arg(long, alias = "initial")]
     pub initial_quality: Option<u16>,
@@ -140,18 +144,16 @@ fn map_and_clamp_hq_ingredients(recipe: &raphael_data::Recipe, hq_ingredients: [
         .iter()
         .filter_map(|ingredient| match ingredient.item_id {
             0 => None,
-            id => Some((*raphael_data::ITEMS.get(&id).unwrap(), ingredient.amount)),
+            id => Some((*raphael_data::ITEMS.get(id).unwrap(), ingredient.amount)),
         })
         .collect();
 
     let mut modified_hq_ingredients: [u8; 6] = [0; 6];
     let mut hq_ingredient_index: usize = 0;
-    for (index, (item, max_amount)) in ingredients.into_iter().enumerate() {
-        if item.can_be_hq {
-            modified_hq_ingredients[index] =
-                hq_ingredients[hq_ingredient_index].clamp(0, max_amount as u8);
-            hq_ingredient_index = hq_ingredient_index.saturating_add(1);
-        }
+    for (index, (_item_id, max_amount)) in ingredients.into_iter().enumerate() {
+        modified_hq_ingredients[index] =
+            hq_ingredients[hq_ingredient_index].clamp(0, max_amount as u8);
+        hq_ingredient_index = hq_ingredient_index.saturating_add(1);
     }
 
     modified_hq_ingredients
@@ -192,10 +194,9 @@ pub fn execute(args: &SolveArgs) {
             req_control: 0,
         }
     } else if args.recipe_id.is_some() {
-        *RECIPES.get(&args.recipe_id.unwrap()).expect(&format!(
-            "Unable to find Recipe with ID: {}",
-            args.recipe_id.unwrap()
-        ))
+        *RECIPES
+            .get(args.recipe_id.unwrap())
+            .unwrap_or_else(|| panic!("Unable to find Recipe with ID: {}", args.recipe_id.unwrap()))
     } else {
         log::warn!(
             "Item IDs do not uniquely corresponds to a specific recipe config. Consider using the recipe ID instead.\nThe first match, i.e. the recipe with the lowest ID, will be selected."
@@ -203,15 +204,17 @@ pub fn execute(args: &SolveArgs) {
         *RECIPES
             .values()
             .find(|recipe| recipe.item_id == args.item_id.unwrap())
-            .expect(&format!(
-                "Unable to find Recipe for an item with item ID: {}",
-                args.item_id.unwrap()
-            ))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Unable to find Recipe for an item with item ID: {}",
+                    args.item_id.unwrap()
+                )
+            })
     };
     let recipe_id = RECIPES
         .entries()
         .find(|(_, entry_recipe)| **entry_recipe == recipe)
-        .map(|(recipe_id, _)| *recipe_id)
+        .map(|(recipe_id, _)| recipe_id)
         .unwrap_or_default();
     let food = match args.food {
         Some(food_arg) => {
@@ -232,7 +235,7 @@ pub fn execute(args: &SolveArgs) {
                 MEALS
                     .iter()
                     .find(|m| (m.item_id == item_id) && (m.hq == is_hq))
-                    .expect(&format!("Unable to find Food with item ID: {item_id}"))
+                    .unwrap_or_else(|| panic!("Unable to find Food with item ID: {item_id}"))
                     .to_owned(),
             )
         }
@@ -257,7 +260,7 @@ pub fn execute(args: &SolveArgs) {
                 POTIONS
                     .iter()
                     .find(|m| (m.item_id == item_id) && (m.hq == is_hq))
-                    .expect(&format!("Unable to find Potion with item ID: {item_id}"))
+                    .unwrap_or_else(|| panic!("Unable to find Potion with item ID: {item_id}"))
                     .to_owned(),
             )
         }
@@ -311,6 +314,9 @@ pub fn execute(args: &SolveArgs) {
         get_game_settings(recipe, custom_recipe_overrides, crafter_stats, food, potion);
     settings.adversarial = args.adversarial;
     settings.backload_progress = args.backload_progress;
+    if let Some(stellar_steady_hand) = args.stellar_steady_hand {
+        settings.stellar_steady_hand_charges = stellar_steady_hand.min(3);
+    }
 
     let target_quality = match args.target_quality {
         Some(target) => target.clamp(0, settings.max_quality),
@@ -339,6 +345,7 @@ pub fn execute(args: &SolveArgs) {
 
     let solver_settings = SolverSettings {
         simulator_settings: settings,
+        allow_non_max_quality_solutions: true,
     };
 
     let mut solver = MacroSolver::new(
@@ -351,10 +358,10 @@ pub fn execute(args: &SolveArgs) {
 
     let final_state = SimulationState::from_macro(&settings, &actions).unwrap();
     let state_quality = final_state.quality;
-    let final_quality = state_quality + u32::from(initial_quality);
+    let final_quality = state_quality.saturating_add(initial_quality);
     let steps = actions.len();
     let duration: u8 = actions.iter().map(|action| action.time_cost()).sum();
-     let action_ids: Vec<u32> = actions.iter().map(|f| f.action_id()).collect();
+    let action_ids: Vec<u32> = actions.iter().map(|f| f.action_id()).collect();
 
     if args.output_variables.is_empty() {
         println!("Recipe ID: {}", recipe_id);
@@ -392,6 +399,7 @@ pub fn execute(args: &SolveArgs) {
                 "target_quality" => format!("{:?}", target_quality),
                 "recipe_max_quality" => format!("{:?}", recipe_max_quality),
                 "actions" => format!("\"{:?}\"", actions),
+                "action_ids" => format!("\"{:?}\"", action_ids),
                 "ids" => format!("\"{:?}\"", action_ids),
                 "final_state" => format!("\"{:?}\"", final_state),
                 "state_quality" => format!("{:?}", state_quality),

@@ -1,4 +1,5 @@
 use crate::{Action, ActionImpl};
+use strum::IntoEnumIterator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -12,18 +13,26 @@ pub struct Settings {
     pub job_level: u8,
     pub allowed_actions: ActionMask,
     pub adversarial: bool,
-    /// If `backload_progress` is set, after using any action that increases Progress, the simulator will forbid the use of actions that directly increase Quality.
+
+    /// If set, the simulator will forbid the use of Quality-increasing actions after
+    /// Progress has increased at least once.
     pub backload_progress: bool,
+
+    /// The number of Stellar Steady Hand uses available at the start of the synthesis.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub stellar_steady_hand_charges: u8,
 }
 
 impl Settings {
+    /// An action is allowed if the current level meets the level requirement of the action
+    /// and if the action isn't explicitly forbidden by the action mask.
     pub fn is_action_allowed<ACTION: ActionImpl>(&self) -> bool {
         self.job_level >= ACTION::LEVEL_REQUIREMENT
             && self.allowed_actions.has_mask(ACTION::ACTION_MASK)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ActionMask {
     mask: u64,
@@ -44,6 +53,14 @@ impl ActionMask {
 
     pub const fn all() -> Self {
         Self { mask: u64::MAX }
+    }
+
+    /// Excludes TrainedEye and specialist actions
+    pub const fn regular() -> Self {
+        Self::all()
+            .remove(Action::TrainedEye)
+            .remove(Action::HeartAndSoul)
+            .remove(Action::QuickInnovation)
     }
 
     pub const fn has(self, action: Action) -> bool {
@@ -90,66 +107,18 @@ impl ActionMask {
             mask: self.mask & (!other.mask),
         }
     }
-
-    pub fn actions(self) -> Box<[Action]> {
-        ALL_ACTIONS
-            .iter()
-            .copied()
-            .filter(|action| ((self.mask >> *action as u64) & 1) != 0)
-            .collect()
-    }
-
-    pub fn actions_iter(self) -> impl Iterator<Item = Action> {
-        ALL_ACTIONS
-            .iter()
-            .copied()
-            .filter(move |action| ((self.mask >> *action as u64) & 1) != 0)
-    }
 }
 
-#[macro_export]
-macro_rules! action_mask {
-    ( $( $x:expr ),* ) => {
-        {
-            let mut action_mask = ActionMask::none();
-            $(
-                action_mask = action_mask.add($x);
-            )*
-            action_mask
+impl std::fmt::Debug for ActionMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut disallowed_actions = Vec::new();
+        for action in Action::iter() {
+            if !self.has(action) {
+                disallowed_actions.push(action);
+            }
         }
-    };
+        f.debug_struct("ActionMask")
+            .field("disallowed_actions", &disallowed_actions)
+            .finish()
+    }
 }
-
-const ALL_ACTIONS: &[Action] = &[
-    Action::BasicSynthesis,
-    Action::BasicTouch,
-    Action::MasterMend,
-    Action::Observe,
-    Action::TricksOfTheTrade,
-    Action::WasteNot,
-    Action::Veneration,
-    Action::StandardTouch,
-    Action::GreatStrides,
-    Action::Innovation,
-    Action::WasteNot2,
-    Action::ByregotsBlessing,
-    Action::PreciseTouch,
-    Action::MuscleMemory,
-    Action::CarefulSynthesis,
-    Action::Manipulation,
-    Action::PrudentTouch,
-    Action::TrainedEye,
-    Action::Reflect,
-    Action::PreparatoryTouch,
-    Action::Groundwork,
-    Action::DelicateSynthesis,
-    Action::IntensiveSynthesis,
-    Action::AdvancedTouch,
-    Action::HeartAndSoul,
-    Action::PrudentSynthesis,
-    Action::TrainedFinesse,
-    Action::RefinedTouch,
-    Action::ImmaculateMend,
-    Action::TrainedPerfection,
-    Action::QuickInnovation,
-];

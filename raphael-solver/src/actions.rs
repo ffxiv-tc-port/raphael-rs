@@ -1,3 +1,5 @@
+use strum::EnumCount;
+
 use raphael_sim::*;
 
 use crate::SolverSettings;
@@ -11,10 +13,48 @@ pub enum ActionCombo {
     AdvancedTouch,      // Basic Touch + Standard Touch + Advanced Touch
     FocusedTouch,       // Observe + AdvancedTouch
     RefinedTouch,       // Basic Touch + Refined Touch
+    None,               // No action
     Single(Action),
 }
 
 impl ActionCombo {
+    pub const fn into_bits(self) -> u8 {
+        match self {
+            Self::Single(action) => action.into_bits(),
+            Self::TricksOfTheTrade => Action::COUNT as u8,
+            Self::IntensiveSynthesis => Action::COUNT as u8 + 1,
+            Self::PreciseTouch => Action::COUNT as u8 + 2,
+            Self::StandardTouch => Action::COUNT as u8 + 3,
+            Self::AdvancedTouch => Action::COUNT as u8 + 4,
+            Self::FocusedTouch => Action::COUNT as u8 + 5,
+            Self::RefinedTouch => Action::COUNT as u8 + 6,
+            Self::None => Action::COUNT as u8 + 7,
+        }
+    }
+
+    pub const fn from_bits(bits: u8) -> Self {
+        const N: u8 = Action::COUNT as u8;
+        if bits < N {
+            Self::Single(Action::from_bits(bits))
+        } else if bits == N {
+            Self::TricksOfTheTrade
+        } else if bits == N + 1 {
+            Self::IntensiveSynthesis
+        } else if bits == N + 2 {
+            Self::PreciseTouch
+        } else if bits == N + 3 {
+            Self::StandardTouch
+        } else if bits == N + 4 {
+            Self::AdvancedTouch
+        } else if bits == N + 5 {
+            Self::FocusedTouch
+        } else if bits == N + 6 {
+            Self::RefinedTouch
+        } else {
+            Self::None
+        }
+    }
+
     pub const fn actions(self) -> &'static [Action] {
         match self {
             Self::TricksOfTheTrade => &[Action::HeartAndSoul, Action::TricksOfTheTrade],
@@ -28,6 +68,7 @@ impl ActionCombo {
             ],
             Self::FocusedTouch => &[Action::Observe, Action::AdvancedTouch],
             Self::RefinedTouch => &[Action::BasicTouch, Action::RefinedTouch],
+            Self::None => &[],
             Self::Single(action) => match action {
                 Action::BasicSynthesis => &[Action::BasicSynthesis],
                 Action::BasicTouch => &[Action::BasicTouch],
@@ -60,6 +101,10 @@ impl ActionCombo {
                 Action::QuickInnovation => &[Action::QuickInnovation],
                 Action::ImmaculateMend => &[Action::ImmaculateMend],
                 Action::TrainedPerfection => &[Action::TrainedPerfection],
+                Action::StellarSteadyHand => &[Action::StellarSteadyHand],
+                Action::RapidSynthesis => &[Action::RapidSynthesis],
+                Action::HastyTouch => &[Action::HastyTouch],
+                Action::DaringTouch => &[Action::DaringTouch],
             },
         }
     }
@@ -73,7 +118,7 @@ impl ActionCombo {
     }
 }
 
-pub const FULL_SEARCH_ACTIONS: &[ActionCombo] = &[
+pub const FULL_SEARCH_ACTIONS: [ActionCombo; 36] = [
     ActionCombo::AdvancedTouch,
     ActionCombo::TricksOfTheTrade,
     ActionCombo::IntensiveSynthesis,
@@ -88,6 +133,7 @@ pub const FULL_SEARCH_ACTIONS: &[ActionCombo] = &[
     ActionCombo::Single(Action::CarefulSynthesis),
     ActionCombo::Single(Action::Groundwork),
     ActionCombo::Single(Action::PrudentSynthesis),
+    ActionCombo::Single(Action::RapidSynthesis),
     // quality
     ActionCombo::Single(Action::BasicTouch),
     ActionCombo::Single(Action::StandardTouch),
@@ -101,6 +147,8 @@ pub const FULL_SEARCH_ACTIONS: &[ActionCombo] = &[
     ActionCombo::Single(Action::TrainedFinesse),
     ActionCombo::Single(Action::TrainedEye),
     ActionCombo::Single(Action::QuickInnovation),
+    ActionCombo::Single(Action::HastyTouch),
+    ActionCombo::Single(Action::DaringTouch),
     // durability
     ActionCombo::Single(Action::MasterMend),
     ActionCombo::Single(Action::WasteNot),
@@ -110,9 +158,10 @@ pub const FULL_SEARCH_ACTIONS: &[ActionCombo] = &[
     ActionCombo::Single(Action::TrainedPerfection),
     // misc
     ActionCombo::Single(Action::DelicateSynthesis),
+    ActionCombo::Single(Action::StellarSteadyHand),
 ];
 
-pub const PROGRESS_ONLY_SEARCH_ACTIONS: &[ActionCombo] = &[
+pub const PROGRESS_ONLY_SEARCH_ACTIONS: [ActionCombo; 16] = [
     ActionCombo::IntensiveSynthesis,
     ActionCombo::TricksOfTheTrade,
     // progress
@@ -122,6 +171,7 @@ pub const PROGRESS_ONLY_SEARCH_ACTIONS: &[ActionCombo] = &[
     ActionCombo::Single(Action::CarefulSynthesis),
     ActionCombo::Single(Action::Groundwork),
     ActionCombo::Single(Action::PrudentSynthesis),
+    ActionCombo::Single(Action::RapidSynthesis),
     // durability
     ActionCombo::Single(Action::MasterMend),
     ActionCombo::Single(Action::WasteNot),
@@ -129,20 +179,26 @@ pub const PROGRESS_ONLY_SEARCH_ACTIONS: &[ActionCombo] = &[
     ActionCombo::Single(Action::Manipulation),
     ActionCombo::Single(Action::ImmaculateMend),
     ActionCombo::Single(Action::TrainedPerfection),
+    // misc
+    ActionCombo::Single(Action::StellarSteadyHand),
 ];
 
 pub fn use_action_combo(
     settings: &SolverSettings,
     mut state: SimulationState,
     action_combo: ActionCombo,
-) -> Result<SimulationState, &'static str> {
+) -> Result<SimulationState, ActionError> {
     for action in action_combo.actions() {
         state = state.use_action(*action, Condition::Normal, &settings.simulator_settings)?;
-        if state.effects.allow_quality_actions() && state.quality >= settings.max_quality() {
-            state.unreliable_quality = 0;
-            state.effects = state.effects.strip_quality_effects();
-        }
     }
-    state.effects.set_combo(Combo::None);
+    // All combos are already implemented as ActionCombo, so we reset the combo to None for cases
+    // where the full combo is not used, reducing state space.
+    if state.effects.combo() != Combo::SynthesisBegin {
+        state.effects.set_combo(Combo::None);
+    }
+    // Expedience enables Daring Touch, but Daring Touch can only be used if Stellar Steady Hand is active.
+    if state.effects.stellar_steady_hand() == 0 {
+        state.effects.set_expedience(false);
+    }
     Ok(state)
 }

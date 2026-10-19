@@ -1,4 +1,6 @@
-use raphael_sim::{Action, ActionMask, Condition, Settings, SimulationState};
+use raphael_sim::{
+    Action, ActionError, ActionMask, Condition, Settings, SimulationState, SpecialQualityState,
+};
 
 const SETTINGS: Settings = Settings {
     max_cp: 500,
@@ -11,6 +13,7 @@ const SETTINGS: Settings = Settings {
     allowed_actions: ActionMask::all(),
     adversarial: true,
     backload_progress: true,
+    stellar_steady_hand_charges: 0,
 };
 
 #[test]
@@ -23,7 +26,9 @@ fn test_effects() {
     state.effects.set_inner_quiet(2);
     state.effects.set_innovation(2);
     state.effects.set_great_strides(2);
-    state.effects.set_adversarial_guard(true);
+    state
+        .effects
+        .set_special_quality_state(SpecialQualityState::AdversarialGuard);
     state.effects.set_quick_innovation_available(true);
     let state = state
         .use_action(Action::MuscleMemory, Condition::Normal, &SETTINGS)
@@ -32,9 +37,11 @@ fn test_effects() {
     assert_eq!(state.effects.inner_quiet(), 0);
     assert_eq!(state.effects.innovation(), 0);
     assert_eq!(state.effects.great_strides(), 0);
-    assert_eq!(state.effects.adversarial_guard(), false);
     assert_eq!(state.effects.quick_innovation_available(), false);
-    assert_eq!(state.effects.allow_quality_actions(), false);
+    assert_eq!(
+        state.effects.special_quality_state(),
+        SpecialQualityState::Forbidden
+    );
 }
 
 #[test]
@@ -45,16 +52,22 @@ fn test_quality_actions_forbidden() {
         &[Action::Reflect, Action::BasicSynthesis, Action::Observe],
     )
     .unwrap();
+
     let result = state.use_action(Action::BasicTouch, Condition::Normal, &SETTINGS);
-    assert_eq!(result, Err("Forbidden by backload_progress setting"));
+    assert_eq!(result, Err(ActionError::QualityAfterProgress));
+
     let result = state.use_action(Action::PreciseTouch, Condition::Good, &SETTINGS);
-    assert_eq!(result, Err("Forbidden by backload_progress setting"));
+    assert_eq!(result, Err(ActionError::QualityAfterProgress));
+
+    let result = state.use_action(Action::Innovation, Condition::Normal, &SETTINGS);
+    assert_eq!(result, Err(ActionError::QualityAfterProgress));
+
+    let result = state.use_action(Action::GreatStrides, Condition::Normal, &SETTINGS);
+    assert_eq!(result, Err(ActionError::QualityAfterProgress));
+
     // Using a Progress-action resets Inner Quiet.
     let result = state.use_action(Action::ByregotsBlessing, Condition::Normal, &SETTINGS);
-    assert_eq!(
-        result,
-        Err("Cannot use Byregot's Blessing when Inner Quiet is 0.")
-    );
+    assert_eq!(result, Err(ActionError::SpecialConditionNotMet));
 }
 
 #[test]
@@ -62,5 +75,8 @@ fn test_quality_actions_forbidden() {
 /// It is the only action that increases Progress and Quality at the same time.
 fn test_delicate_synthesis() {
     let state = SimulationState::from_macro(&SETTINGS, &[Action::DelicateSynthesis]).unwrap();
-    assert_eq!(state.effects.allow_quality_actions(), false);
+    assert_eq!(
+        state.effects.special_quality_state(),
+        SpecialQualityState::Forbidden
+    );
 }

@@ -5,9 +5,14 @@ mod app;
 pub use app::MacroSolverApp;
 
 mod config;
+mod context;
+mod elements;
+mod fonts;
+mod solve;
 mod thread_pool;
-mod util;
-mod widgets;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod update;
 
 #[cfg(target_arch = "wasm32")]
 pub static OOM_PANIC_OCCURED: std::sync::atomic::AtomicBool =

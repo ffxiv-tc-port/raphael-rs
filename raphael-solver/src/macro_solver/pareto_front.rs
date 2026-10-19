@@ -1,136 +1,205 @@
+use std::sync::Mutex;
+
 use raphael_sim::{Effects, SimulationState};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-const EFFECTS_MASK: u32 = Effects::new()
-    .with_inner_quiet(0b1110)
-    .with_muscle_memory(0b111)
-    .with_manipulation(0b1100)
-    .with_waste_not(0b1100)
-    .with_great_strides(0b10)
-    .with_heart_and_soul_active(true)
-    .with_heart_and_soul_available(true)
-    .with_trained_perfection_active(true)
-    .with_trained_perfection_available(true)
-    .with_quick_innovation_available(true)
+// It is important that this mask doesn't use any effect to its full bit range.
+// Otherwise, `Value::effect_dominates` will break.
+const EFFECTS_VALUE_MASK: u64 = Effects::new()
+    .with_inner_quiet(1)
+    .with_manipulation(3)
+    .with_waste_not(3)
+    .with_great_strides(1)
+    .with_veneration(3)
+    .with_innovation(3)
     .into_bits();
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+const EFFECTS_KEY_MASK: u64 = !EFFECTS_VALUE_MASK;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Key {
-    progress: u32,
-    cp: u16,
-    durability: u16,
-    effects: u32,
+    progress: u16,
+    effects: u64,
 }
 
 impl From<&SimulationState> for Key {
     fn from(state: &SimulationState) -> Self {
         Self {
             progress: state.progress,
-            cp: state.cp.next_multiple_of(64),
-            durability: state.durability.next_multiple_of(15),
-            effects: state.effects.into_bits() & EFFECTS_MASK,
+            effects: state.effects.into_bits() & EFFECTS_KEY_MASK,
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Value {
-    cp: u16,
-    durability: u16,
-    quality: u32,
-    unreliable_quality: u32,
-    effects: Effects,
+#[derive(Debug, Clone, Copy)]
+struct Value(wide::u32x4);
+
+impl Value {
+    /// Guard value for Pareto-dominance check.
+    /// Value A dominates B is subtracting B from A leaves the guard bits unchanged.
+    const GUARD: wide::u32x4 = {
+        // The effect bits used for comparison are truncated to 32 bits to make
+        // everything fit into a 128-bit SIMD value.
+        // The asserts make sure that no information is lost when truncating.
+        assert!(EFFECTS_KEY_MASK >> 32 == 0xffffffff);
+        assert!(EFFECTS_VALUE_MASK >> 32 == 0x00000000);
+        wide::u32x4::new([
+            0x80008000,              // CP and Durability
+            0x80000000,              // Quality
+            0x80000000,              // Unreliable quality
+            EFFECTS_KEY_MASK as u32, // Effects
+        ])
+    };
+
+    /// `A` dominates `B` if every member of `A` is geq the corresponding member in `B`.
+    fn dominates(&self, other: &Self) -> bool {
+        let guarded_value = Self::GUARD | self.0;
+        (guarded_value - other.0) & Self::GUARD == Self::GUARD
+    }
+
+    fn cp(&self) -> u16 {
+        (self.0.as_array()[0] >> 16) as u16
+    }
 }
 
 impl From<&SimulationState> for Value {
     fn from(state: &SimulationState) -> Self {
-        Self {
-            cp: state.cp,
-            durability: state.durability,
-            quality: state.quality,
-            unreliable_quality: state.unreliable_quality,
-            effects: state.effects,
-        }
+        Self(wide::u32x4::new([
+            (u32::from(state.cp) << 16) + u32::from(state.durability),
+            u32::from(state.quality),
+            u32::from(state.quality) + u32::from(state.unreliable_quality),
+            (state.effects.into_bits() & EFFECTS_VALUE_MASK) as u32,
+        ]))
     }
 }
 
-impl Value {
-    fn dominates(&self, other: &Self) -> bool {
-        self.cp >= other.cp
-            && self.durability >= other.durability
-            && self.quality_dominates(other)
-            && self.effect_dominates(other)
-    }
+struct IntermediateNode {
+    partition_point: u16,
+    lhs: Box<TreeNode>,
+    rhs: Box<TreeNode>,
+}
 
-    #[inline]
-    fn quality_dominates(&self, other: &Self) -> bool {
-        let adversarial_dominates = self.unreliable_quality >= other.unreliable_quality
-            || self.quality >= other.quality + other.unreliable_quality;
-        self.quality >= other.quality && adversarial_dominates
-    }
+struct LeafNode {
+    range_min: u16,
+    range_max: u16,
+    values: Vec<Value>,
+}
 
-    #[inline]
-    fn effect_dominates(&self, other: &Self) -> bool {
-        let allow_quality_actions_dominates =
-            self.effects.allow_quality_actions() || !other.effects.allow_quality_actions();
-        let adversarial_guard_dominates =
-            self.effects.adversarial_guard() || !other.effects.adversarial_guard();
-        self.effects.inner_quiet() >= other.effects.inner_quiet()
-            && self.effects.muscle_memory() >= other.effects.muscle_memory()
-            && self.effects.innovation() >= other.effects.innovation()
-            && self.effects.veneration() >= other.effects.veneration()
-            && self.effects.great_strides() >= other.effects.great_strides()
-            && self.effects.manipulation() >= other.effects.manipulation()
-            && self.effects.waste_not() >= other.effects.waste_not()
-            && allow_quality_actions_dominates
-            && adversarial_guard_dominates
+enum TreeNode {
+    Intermediate(IntermediateNode),
+    Leaf(LeafNode),
+}
+
+impl Default for TreeNode {
+    fn default() -> Self {
+        Self::Leaf(LeafNode {
+            range_min: u16::MIN,
+            range_max: u16::MAX,
+            values: Vec::new(),
+        })
     }
 }
 
 #[derive(Default)]
 pub struct ParetoFront {
-    buckets: FxHashMap<Key, Vec<Value>>,
+    buckets: FxHashMap<Key, Mutex<TreeNode>>,
 }
 
 impl ParetoFront {
-    pub fn insert(&mut self, state: SimulationState) -> bool {
-        #[cfg(test)]
-        assert_eq!(state.effects.combo(), raphael_sim::Combo::None);
-        let bucket = self.buckets.entry(Key::from(&state)).or_default();
-        let new_value = Value::from(&state);
-        let is_dominated = bucket.iter().any(|value| value.dominates(&new_value));
-        if is_dominated {
-            false
-        } else {
-            bucket.retain(|value| !new_value.dominates(value));
-            bucket.push(new_value);
-            true
+    /// Inserts all non-dominated elements into the pareto front while also removing dominated values
+    /// from the pareto front. Returns an iterator over elements that were inserted.
+    pub fn insert_batch<T: Clone + Send + Sync>(
+        &mut self,
+        mut elements: Vec<T>,
+        to_state: impl Fn(&T) -> &SimulationState + Sync,
+    ) -> impl Iterator<Item = T> {
+        // Group elements by their key to avoid contention in the hashmap.
+        let elements_by_key: Vec<(Key, &[T])> = {
+            let mut result = Vec::new();
+            elements.par_sort_unstable_by_key(|element| Key::from(to_state(element)));
+            let mut elements_slice = elements.as_slice();
+            for idx in (1..elements_slice.len()).rev() {
+                let lhs_key = Key::from(to_state(&elements_slice[idx - 1]));
+                let rhs_key = Key::from(to_state(&elements_slice[idx]));
+                if lhs_key != rhs_key {
+                    let rhs_slice = elements_slice.split_off(idx..).unwrap();
+                    result.push((rhs_key, rhs_slice));
+                }
+            }
+            if !elements_slice.is_empty() {
+                let key = Key::from(to_state(elements_slice.first().unwrap()));
+                result.push((key, elements_slice));
+            }
+            result
+        };
+        // Make sure all keys exist in the hashmap.
+        for (key, _elements) in &elements_by_key {
+            self.buckets.entry(*key).or_default();
         }
+        // Update pareto front and return non-dominated elements.
+        let non_dominated_elements = elements_by_key
+            .into_par_iter()
+            .with_max_len(1)
+            .map(|(key, elements)| {
+                // Copy elements into own Vec to prevent false sharing.
+                let mut elements = elements.to_vec();
+                // Sort elements in a way that ensures an element cannot be dominated
+                // by another element that comes later in the list.
+                elements.sort_unstable_by_key(|element| {
+                    let state = to_state(element);
+                    let weight = u64::from(state.cp)
+                        + u64::from(state.durability)
+                        + u64::from(state.quality)
+                        + u64::from(state.unreliable_quality)
+                        + state.effects.into_bits();
+                    std::cmp::Reverse(weight)
+                });
+                let mut root_node = self.buckets.get(&key).unwrap().lock().unwrap();
+                elements.retain(|element| Self::insert(to_state(element), &mut root_node));
+                elements
+            })
+            .collect::<Vec<_>>();
+        non_dominated_elements.into_iter().flatten()
     }
 
-    /// Returns the sum of the squared size of all Pareto buckets.
-    /// This is a useful performance metric because the total insertion cost of each Pareto bucket scales with the square of its size.
-    pub fn buckets_squared_size_sum(&self) -> usize {
-        self.buckets
-            .values()
-            .map(|bucket| bucket.len() * bucket.len())
-            .sum()
-    }
-}
-
-impl Drop for ParetoFront {
-    fn drop(&mut self) {
-        let largest_bucket = self.buckets.iter().max_by_key(|(_key, elems)| elems.len());
-        let pareto_entries: usize = self.buckets.values().map(Vec::len).sum();
-        log::debug!(
-            "ParetoFront - buckets: {}, entries: {}, largest_bucket_len: {}",
-            self.buckets.len(),
-            pareto_entries,
-            largest_bucket.map_or(0, |(_key, elems)| elems.len())
-        );
-        log::trace!(
-            "ParetoFront - largest_bucket_key: {:?}",
-            largest_bucket.map_or(Key::default(), |(key, _elems)| *key)
-        );
+    fn insert(state: &SimulationState, mut node: &mut TreeNode) -> bool {
+        const MAX_LEAF_SIZE: usize = 200;
+        let new_value = Value::from(state);
+        while let TreeNode::Intermediate(intermediate) = node {
+            if new_value.cp() < intermediate.partition_point {
+                node = intermediate.lhs.as_mut();
+            } else {
+                node = intermediate.rhs.as_mut();
+            }
+        }
+        if let TreeNode::Leaf(leaf) = node {
+            let is_dominated = leaf.values.iter().any(|value| value.dominates(&new_value));
+            if !is_dominated {
+                leaf.values.retain(|value| !new_value.dominates(value));
+                leaf.values.push(new_value);
+            }
+            if leaf.values.len() > MAX_LEAF_SIZE && leaf.range_min + 1 != leaf.range_max {
+                leaf.values.sort_unstable_by_key(Value::cp);
+                let (lhs_values, rhs_values) = leaf.values.split_at(MAX_LEAF_SIZE / 2);
+                let partition_point = rhs_values[0].cp();
+                *node = TreeNode::Intermediate(IntermediateNode {
+                    partition_point,
+                    lhs: Box::new(TreeNode::Leaf(LeafNode {
+                        range_min: leaf.range_min,
+                        range_max: partition_point,
+                        values: lhs_values.into(),
+                    })),
+                    rhs: Box::new(TreeNode::Leaf(LeafNode {
+                        range_min: partition_point,
+                        range_max: leaf.range_max,
+                        values: rhs_values.into(),
+                    })),
+                });
+            }
+            !is_dominated
+        } else {
+            unreachable!()
+        }
     }
 }

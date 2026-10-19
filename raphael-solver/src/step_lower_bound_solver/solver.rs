@@ -1,196 +1,95 @@
-use std::num::NonZeroU8;
+use std::num::{NonZero, NonZeroU8};
 
 use crate::{
     SolverException, SolverSettings,
-    actions::{ActionCombo, FULL_SEARCH_ACTIONS, PROGRESS_ONLY_SEARCH_ACTIONS, use_action_combo},
-    utils::{self, largest_single_action_progress_increase},
+    actions::{FULL_SEARCH_ACTIONS, use_action_combo},
+    macros::internal_error,
+    utils::{self, ParetoFrontBuilder, ParetoValue, compute_iq_quality_lut},
 };
+
+use bump_scope::{BumpPool, BumpPoolGuard};
 use raphael_sim::*;
-use rayon::iter::{
-    FromParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
-};
-use rustc_hash::FxHashSet;
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::state::ReducedState;
 
-type ParetoValue = utils::ParetoValue<u32, u32>;
-type ParetoFrontBuilder = utils::ParetoFrontBuilder<u32, u32>;
-type SolvedStates = rustc_hash::FxHashMap<ReducedState, Box<[ParetoValue]>>;
+pub type ParetoFront = nunny::Slice<ParetoValue>;
+pub type SolvedStates<'alloc> = FxHashMap<ReducedState, &'alloc ParetoFront>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct StepLbSolverStats {
-    pub parallel_states: usize,
-    pub sequential_states: usize,
-    pub pareto_values: usize,
+    pub states_on_main: usize,
+    pub states_on_shards: usize,
+    pub values: usize,
 }
 
-pub struct StepLbSolver {
+#[derive(Clone)]
+struct StepLbSolverContext<'alloc> {
+    allocator: &'alloc BumpPool,
     settings: SolverSettings,
     interrupt_signal: utils::AtomicFlag,
-    solved_states: SolvedStates,
-    pareto_front_builder: ParetoFrontBuilder,
-    precompute_templates: Vec<Template>,
-    next_precompute_step_budget: NonZeroU8,
-    precomputed_states: usize,
-    iq_quality_lut: [u32; 11],
-    largest_progress_increase: u32,
+    iq_quality_lut: [u16; 11],
+    largest_progress_increase: u16,
 }
 
-impl StepLbSolver {
-    pub fn new(mut settings: SolverSettings, interrupt_signal: utils::AtomicFlag) -> Self {
+pub struct StepLbSolver<'alloc> {
+    context: StepLbSolverContext<'alloc>,
+    solved_states: SolvedStates<'alloc>,
+    num_states_solved_on_shards: usize,
+}
+
+pub struct StepLbSolverShard<'main, 'alloc> {
+    context: &'main StepLbSolverContext<'alloc>,
+    shared_states: &'main SolvedStates<'alloc>,
+    local_states: SolvedStates<'alloc>,
+    pf_builder: ParetoFrontBuilder,
+}
+
+impl<'alloc> StepLbSolver<'alloc> {
+    pub fn new(
+        mut settings: SolverSettings,
+        interrupt_signal: utils::AtomicFlag,
+        allocator: &'alloc BumpPool,
+    ) -> Self {
+        let iq_quality_lut = compute_iq_quality_lut(&settings);
         settings.simulator_settings.adversarial = false;
         ReducedState::optimize_action_mask(&mut settings.simulator_settings);
         Self {
-            settings,
-            interrupt_signal,
+            context: StepLbSolverContext {
+                allocator,
+                settings,
+                interrupt_signal,
+                iq_quality_lut,
+                largest_progress_increase: utils::maximum_muscle_memory_utilization(
+                    &settings.simulator_settings,
+                ),
+            },
             solved_states: SolvedStates::default(),
-            pareto_front_builder: ParetoFrontBuilder::new(
-                settings.max_progress(),
-                settings.max_quality(),
-            ),
-            precompute_templates: Self::generate_precompute_templates(&settings),
-            next_precompute_step_budget: NonZeroU8::new(1).unwrap(),
-            precomputed_states: 0,
-            iq_quality_lut: utils::compute_iq_quality_lut(&settings),
-            largest_progress_increase: largest_single_action_progress_increase(&settings),
+            num_states_solved_on_shards: 0,
         }
     }
 
-    fn generate_precompute_templates(settings: &SolverSettings) -> Vec<Template> {
-        let mut templates = rustc_hash::FxHashSet::<Template>::default();
-        let mut queue = std::collections::VecDeque::<Template>::new();
-
-        let seed_template = Template {
-            durability: settings.max_durability(),
-            effects: Effects::initial(&settings.simulator_settings)
-                .with_quick_innovation_available(false)
-                .with_heart_and_soul_available(false)
-                .with_adversarial_guard(false)
-                .with_combo(Combo::None),
-        };
-        templates.insert(seed_template);
-        queue.push_back(seed_template);
-
-        while let Some(template) = queue.pop_front() {
-            let state = template.instantiate(NonZeroU8::MAX);
-            let search_actions = match state.effects.allow_quality_actions() {
-                false => PROGRESS_ONLY_SEARCH_ACTIONS,
-                true => FULL_SEARCH_ACTIONS,
-            };
-            for &action in search_actions {
-                if let Ok(new_state) = use_action_combo(settings, state.to_state(), action) {
-                    let new_state = ReducedState::from_state(new_state, NonZeroU8::MAX);
-                    if new_state.durability > 0 {
-                        let new_template = Template {
-                            durability: new_state.durability,
-                            effects: new_state.effects,
-                        };
-                        if !templates.contains(&new_template) {
-                            templates.insert(new_template);
-                            queue.push_back(new_template);
-                        }
-                    }
-                }
-            }
+    pub fn create_shard<'main>(&'main self) -> StepLbSolverShard<'main, 'alloc> {
+        StepLbSolverShard {
+            context: &self.context,
+            shared_states: &self.solved_states,
+            local_states: SolvedStates::default(),
+            pf_builder: ParetoFrontBuilder::new(),
         }
-
-        templates.into_iter().collect()
     }
 
-    fn precompute_next_step_budget(&mut self) {
-        // A lot of templates map to the same state at lower step budgets due to effect and durability optimizations.
-        // Here we deduplicate the instantiated templates to avoid solving duplicate states.
-        let instantiated_templates: FxHashSet<ReducedState> = self
-            .precompute_templates
-            .iter()
-            .map(|template| template.instantiate(self.next_precompute_step_budget))
-            .collect();
-
-        let init =
-            || ParetoFrontBuilder::new(self.settings.max_progress(), self.settings.max_quality());
-        let solved_templates = instantiated_templates
-            .into_par_iter()
-            .map_init(init, |pareto_front_builder, state| {
-                let pareto_front = self.solve_precompute_state(pareto_front_builder, state);
-                (state, pareto_front)
-            })
-            .collect_vec_list();
-
-        let num_solved_states_before = self.solved_states.len();
-        self.solved_states
-            .extend(solved_templates.into_iter().flatten());
-        self.precomputed_states += self.solved_states.len() - num_solved_states_before;
-
-        let filtered_templates = self.precompute_templates.par_iter().filter(|template| {
-            let state = template.instantiate(self.next_precompute_step_budget);
-            let pareto_front = self.solved_states.get(&state).unwrap();
-            // Values are sorted Progress-increaasing and Quality-decreasing.
-            // The last value is the value with the most Progress.
-            let value = pareto_front.last().unwrap();
-            // Estimate the max quality that this state ever needs to achieve.
-            // Over-estimating the max needed quality leads to redundant states being precomputed.
-            // Under-estimating the max needed quality could lead to solver crash during precompute from templates being removed too early.
-            let max_needed_quality = {
-                let min_cur_quality = self.iq_quality_lut[usize::from(state.effects.inner_quiet())];
-                self.settings.max_quality().saturating_sub(min_cur_quality)
-            };
-            value.first < self.settings.max_progress() || value.second < max_needed_quality
-        });
-        self.precompute_templates = Vec::from_par_iter(filtered_templates.copied());
-
-        self.next_precompute_step_budget = self.next_precompute_step_budget.saturating_add(1);
-
-        log::trace!(
-            "StepLbSolver - templates: {}, solved_states: {}",
-            self.precompute_templates.len(),
-            self.solved_states.len()
-        );
+    pub fn extend_solved_states(&mut self, new_solved_states: SolvedStates<'alloc>) {
+        let len_before = self.solved_states.len();
+        self.solved_states.extend(new_solved_states);
+        let len_after = self.solved_states.len();
+        self.num_states_solved_on_shards += len_after - len_before;
     }
 
-    fn solve_precompute_state(
-        &self,
-        pareto_front_builder: &mut ParetoFrontBuilder,
-        state: ReducedState,
-    ) -> Box<[ParetoValue]> {
-        pareto_front_builder.clear();
-        pareto_front_builder.push_empty();
-        let search_actions = match state.effects.allow_quality_actions() {
-            false => PROGRESS_ONLY_SEARCH_ACTIONS,
-            true => FULL_SEARCH_ACTIONS,
-        };
-        for &action in search_actions {
-            if state.steps_budget.get() < action.steps() {
-                continue;
-            }
-            let new_step_budget = state.steps_budget.get() - action.steps();
-            if let Ok(new_state) = use_action_combo(&self.settings, state.to_state(), action) {
-                let progress = new_state.progress;
-                let quality = new_state.quality;
-                if let Ok(new_step_budget) = NonZeroU8::try_from(new_step_budget)
-                    && new_state.durability > 0
-                {
-                    let new_state = ReducedState::from_state(new_state, new_step_budget);
-                    if let Some(pareto_front) = self.solved_states.get(&new_state) {
-                        pareto_front_builder.push_slice(pareto_front);
-                    } else {
-                        unreachable!("Parent: {state:?}\nChild: {new_state:?}\nAction: {action:?}");
-                    }
-                    pareto_front_builder
-                        .peek_mut()
-                        .unwrap()
-                        .iter_mut()
-                        .for_each(|value| {
-                            value.first += progress;
-                            value.second += quality;
-                        });
-                    pareto_front_builder.merge();
-                } else if progress != 0 {
-                    pareto_front_builder.push_slice(&[ParetoValue::new(progress, quality)]);
-                    pareto_front_builder.merge();
-                }
-            }
-        }
-        Box::from(pareto_front_builder.peek().unwrap())
+    pub fn precompute(&mut self) -> Result<(), SolverException> {
+        let initial_state = SimulationState::new(&self.context.settings.simulator_settings);
+        self.step_lower_bound(initial_state, 0)?;
+        Ok(())
     }
 
     pub fn step_lower_bound(
@@ -198,15 +97,23 @@ impl StepLbSolver {
         state: SimulationState,
         hint: u8,
     ) -> Result<u8, SolverException> {
-        if !state.effects.allow_quality_actions() && state.quality < self.settings.max_quality() {
+        if self.context.interrupt_signal.is_set() {
+            return Err(SolverException::Interrupted);
+        }
+        if !state.effects.quality_actions_allowed()
+            && state.quality < self.context.settings.max_quality()
+        {
             return Ok(u8::MAX);
         }
         let mut hint = NonZeroU8::try_from(std::cmp::max(hint, 1)).unwrap();
         while self
             .quality_upper_bound(state, hint)?
-            .is_none_or(|quality_ub| quality_ub < self.settings.max_quality())
+            .is_none_or(|quality_ub| quality_ub < self.context.settings.max_quality())
         {
-            hint = hint.checked_add(1).unwrap();
+            match hint.checked_add(1) {
+                Some(new_hint) => hint = new_hint,
+                None => return Ok(u8::MAX),
+            }
         }
         Ok(hint.get())
     }
@@ -215,156 +122,269 @@ impl StepLbSolver {
         &mut self,
         mut state: SimulationState,
         step_budget: NonZeroU8,
-    ) -> Result<Option<u32>, SolverException> {
-        if state.effects.combo() != Combo::None {
-            return Err(SolverException::InternalError(format!(
-                "\"{:?}\" combo in step lower bound solver",
-                state.effects.combo()
-            )));
-        }
-
-        while self.next_precompute_step_budget <= step_budget {
-            self.precompute_next_step_budget();
-        }
-
-        let mut required_progress = self.settings.max_progress() - state.progress;
+    ) -> Result<Option<u16>, SolverException> {
+        let mut required_progress = self.context.settings.max_progress() - state.progress;
         if state.effects.muscle_memory() != 0 {
-            // Assume MuscleMemory can be used to its max potential and remove the effect to reduce the number of states that need to be solved.
-            required_progress = required_progress.saturating_sub(self.largest_progress_increase);
+            // Assume MuscleMemory can be used to its max potential and remove the effect
+            // to reduce the number of states that need to be solved.
+            required_progress =
+                required_progress.saturating_sub(self.context.largest_progress_increase);
             state.effects.set_muscle_memory(0);
         }
-
         let reduced_state = ReducedState::from_state(state, step_budget);
-
-        if let Some(pareto_front) = self.solved_states.get(&reduced_state) {
-            let index = pareto_front.partition_point(|value| value.first < required_progress);
-            let quality_ub = pareto_front
-                .get(index)
-                .map(|value| state.quality + value.second);
-            return Ok(quality_ub);
-        }
-
-        self.solve_state(reduced_state)?;
-
-        if let Some(pareto_front) = self.solved_states.get(&reduced_state) {
-            let index = pareto_front.partition_point(|value| value.first < required_progress);
-            let quality_ub = pareto_front
-                .get(index)
-                .map(|value| state.quality + value.second);
-            return Ok(quality_ub);
+        let pareto_front = if let Some(solution) = self.solved_states.get(&reduced_state).copied() {
+            solution
         } else {
-            unreachable!("State must be in memoization table after solver")
-        }
-    }
-
-    fn solve_state(&mut self, reduced_state: ReducedState) -> Result<(), SolverException> {
-        if self.interrupt_signal.is_set() {
-            return Err(SolverException::Interrupted);
-        }
-        self.pareto_front_builder.push_empty();
-        let search_actions = match reduced_state.effects.allow_quality_actions() {
-            false => PROGRESS_ONLY_SEARCH_ACTIONS,
-            true => FULL_SEARCH_ACTIONS,
+            solve_state_parallel(reduced_state, &self.context, &mut self.solved_states)?
         };
-        for &action in search_actions {
-            if action.steps() <= reduced_state.steps_budget.get() {
-                self.build_child_front(reduced_state, action)?;
-                if self.pareto_front_builder.is_max() {
-                    // stop early if both Progress and Quality are maxed out
-                    // this optimization would work even better with better action ordering
-                    // (i.e. if better actions are visited first)
-                    break;
-                }
-            }
-        }
-        let pareto_front = Box::from(self.pareto_front_builder.peek().unwrap());
-        self.solved_states.insert(reduced_state, pareto_front);
-        Ok(())
-    }
-
-    fn build_child_front(
-        &mut self,
-        reduced_state: ReducedState,
-        action: ActionCombo,
-    ) -> Result<(), SolverException> {
-        if let Ok(new_full_state) =
-            use_action_combo(&self.settings, reduced_state.to_state(), action)
-        {
-            let action_progress = new_full_state.progress;
-            let action_quality = new_full_state.quality;
-            let new_step_budget = reduced_state.steps_budget.get() - action.steps();
-            match NonZeroU8::try_from(new_step_budget) {
-                Ok(new_step_budget) if new_full_state.durability > 0 => {
-                    // New state is not final
-                    let new_reduced_state =
-                        ReducedState::from_state(new_full_state, new_step_budget);
-                    if let Some(pareto_front) = self.solved_states.get(&new_reduced_state) {
-                        self.pareto_front_builder.push_slice(pareto_front);
-                    } else {
-                        self.solve_state(new_reduced_state)?;
-                    }
-                    self.pareto_front_builder
-                        .peek_mut()
-                        .unwrap()
-                        .iter_mut()
-                        .for_each(|value| {
-                            value.first += action_progress;
-                            value.second += action_quality;
-                        });
-                    self.pareto_front_builder.merge();
-                }
-                _ if action_progress != 0 => {
-                    // New state is final and last action increased Progress
-                    self.pareto_front_builder
-                        .push_slice(&[ParetoValue::new(action_progress, action_quality)]);
-                    self.pareto_front_builder.merge();
-                }
-                _ => {
-                    // New state is final but last action did not increase Progress
-                    // Skip this state
-                }
-            }
-        }
-        Ok(())
+        let idx = pareto_front.partition_point(|value| value.progress < required_progress);
+        let quality_ub = pareto_front.get(idx).map(|v| state.quality + v.quality);
+        Ok(quality_ub)
     }
 
     pub fn runtime_stats(&self) -> StepLbSolverStats {
         StepLbSolverStats {
-            parallel_states: self.precomputed_states,
-            sequential_states: self.solved_states.len() - self.precomputed_states,
-            pareto_values: self.solved_states.values().map(|value| value.len()).sum(),
+            states_on_main: self.solved_states.len() - self.num_states_solved_on_shards,
+            states_on_shards: self.num_states_solved_on_shards,
+            values: self.solved_states.values().map(|value| value.len()).sum(),
         }
     }
 }
 
-impl Drop for StepLbSolver {
-    fn drop(&mut self) {
-        let runtime_stats = self.runtime_stats();
-        log::debug!(
-            "StepLbSolver - par_states: {}, seq_states: {}, values: {}",
-            runtime_stats.parallel_states,
-            runtime_stats.sequential_states,
-            runtime_stats.pareto_values
-        );
+impl<'main, 'alloc> StepLbSolverShard<'main, 'alloc> {
+    pub fn solved_states(self) -> SolvedStates<'alloc> {
+        self.local_states
     }
-}
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-struct Template {
-    durability: u16,
-    effects: Effects,
-}
+    pub fn step_lower_bound(
+        &mut self,
+        state: SimulationState,
+        hint: u8,
+    ) -> Result<u8, SolverException> {
+        if self.context.interrupt_signal.is_set() {
+            return Err(SolverException::Interrupted);
+        }
+        if !state.effects.quality_actions_allowed()
+            && state.quality < self.context.settings.max_quality()
+        {
+            return Ok(u8::MAX);
+        }
+        let mut hint = NonZeroU8::try_from(std::cmp::max(hint, 1)).unwrap();
+        while self
+            .quality_upper_bound(state, hint)?
+            .is_none_or(|quality_ub| quality_ub < self.context.settings.max_quality())
+        {
+            match hint.checked_add(1) {
+                Some(new_hint) => hint = new_hint,
+                None => return Ok(u8::MAX),
+            }
+        }
+        Ok(hint.get())
+    }
 
-impl Template {
-    pub fn instantiate(&self, step_budget: NonZeroU8) -> ReducedState {
-        let state = SimulationState {
-            durability: self.durability,
-            effects: self.effects,
-            cp: 0,
-            progress: 0,
-            quality: 0,
-            unreliable_quality: 0,
+    fn quality_upper_bound(
+        &mut self,
+        mut state: SimulationState,
+        step_budget: NonZeroU8,
+    ) -> Result<Option<u16>, SolverException> {
+        let mut required_progress = self.context.settings.max_progress() - state.progress;
+        if state.effects.muscle_memory() != 0 {
+            // Assume MuscleMemory can be used to its max potential and remove the effect
+            // to reduce the number of states that need to be solved.
+            required_progress =
+                required_progress.saturating_sub(self.context.largest_progress_increase);
+            state.effects.set_muscle_memory(0);
+        }
+        let reduced_state = ReducedState::from_state(state, step_budget);
+        let pareto_front = if let Some(solution) = self.shared_states.get(&reduced_state).copied() {
+            solution
+        } else if let Some(solution) = self.local_states.get(&reduced_state).copied() {
+            solution
+        } else {
+            solve_state_sequential(
+                reduced_state,
+                self.context,
+                self.shared_states,
+                &mut self.local_states,
+                &mut self.pf_builder,
+            )?
         };
-        ReducedState::from_state(state, step_budget)
+        let idx = pareto_front.partition_point(|value| value.progress < required_progress);
+        let quality_ub = pareto_front
+            .get(idx)
+            .map(|value| state.quality.saturating_add(value.quality));
+        Ok(quality_ub)
     }
+}
+
+fn discover_unsolved_states(
+    seed_state: ReducedState,
+    settings: &SolverSettings,
+    has_solution: impl Fn(ReducedState) -> bool,
+) -> Vec<ReducedState> {
+    let mut unsolved_states = vec![seed_state];
+    let mut unique_check = FxHashSet::default();
+    let mut idx = 0;
+    while idx < unsolved_states.len() {
+        let parent = unsolved_states[idx];
+        let full_parent = parent.to_state();
+        for action in FULL_SEARCH_ACTIONS {
+            if let Ok(step_budget) =
+                NonZero::try_from(parent.steps_budget.get().saturating_sub(action.steps()))
+                && let Ok(full_child) = use_action_combo(settings, full_parent, action)
+                && !full_child.is_final(&settings.simulator_settings)
+            {
+                let child = ReducedState::from_state(full_child, step_budget);
+                if !unique_check.contains(&child) && !has_solution(child) {
+                    unsolved_states.push(child);
+                    unique_check.insert(child);
+                }
+            }
+        }
+        idx += 1;
+    }
+    unsolved_states
+}
+
+fn construct_solution<'alloc>(
+    state: ReducedState,
+    context: &StepLbSolverContext<'alloc>,
+    pf_builder: &mut ParetoFrontBuilder,
+    get_solution: impl Fn(ReducedState) -> Option<&'alloc ParetoFront>,
+    allocator: &BumpPoolGuard<'alloc>,
+) -> Result<&'alloc ParetoFront, SolverException> {
+    let min_quality = context.iq_quality_lut[usize::from(state.effects.inner_quiet())];
+    let cutoff = ParetoValue::new(
+        context.settings.max_progress(),
+        context.settings.max_quality().saturating_sub(min_quality),
+    );
+    pf_builder.initialize_with_cutoff(cutoff);
+    for action in FULL_SEARCH_ACTIONS {
+        if state.steps_budget.get() < action.steps() {
+            continue;
+        }
+        let new_step_budget = state.steps_budget.get() - action.steps();
+        if let Ok(child_state) = use_action_combo(&context.settings, state.to_state(), action) {
+            let action_value = ParetoValue::new(child_state.progress, child_state.quality);
+            if let Ok(new_step_budget) = NonZeroU8::try_from(new_step_budget)
+                && !child_state.is_final(&context.settings.simulator_settings)
+            {
+                let child_state = ReducedState::from_state(child_state, new_step_budget);
+                if let Some(pareto_front) = get_solution(child_state) {
+                    pf_builder.push_slice(
+                        pareto_front
+                            .iter()
+                            .map(|value| value.saturating_add(action_value)),
+                    );
+                } else {
+                    return Err(internal_error!(
+                        "Required child state does not exist.",
+                        context.settings,
+                        action,
+                        state,
+                        child_state
+                    ));
+                }
+            } else if action_value.progress != 0 {
+                pf_builder.push(action_value);
+            }
+        }
+    }
+    allocator
+        .alloc_slice_copy(pf_builder.result_as_slice())
+        .into_ref()
+        .try_into()
+        .map_err(|_| {
+            internal_error!(
+                "Solver produced empty Pareto front.",
+                context.settings,
+                state
+            )
+        })
+}
+
+fn solve_state_sequential<'alloc>(
+    seed_state: ReducedState,
+    context: &StepLbSolverContext<'alloc>,
+    shared_states: &SolvedStates<'alloc>,
+    local_states: &mut SolvedStates<'alloc>,
+    pf_builder: &mut ParetoFrontBuilder,
+) -> Result<&'alloc ParetoFront, SolverException> {
+    let mut unsolved_states = {
+        let has_solution =
+            |state| shared_states.contains_key(&state) || local_states.contains_key(&state);
+        discover_unsolved_states(seed_state, &context.settings, has_solution)
+    };
+    unsolved_states.sort_unstable_by_key(|state| state.steps_budget);
+    let allocator = context.allocator.get();
+    for state in unsolved_states {
+        let solution = {
+            let get_solution = |state| {
+                shared_states
+                    .get(&state)
+                    .or_else(|| local_states.get(&state))
+                    .copied()
+            };
+            construct_solution(state, context, pf_builder, get_solution, &allocator)?
+        };
+        local_states.insert(state, solution);
+    }
+    local_states.get(&seed_state).copied().ok_or_else(|| {
+        internal_error!(
+            "State not found in memoization table after solving.",
+            context.settings,
+            seed_state
+        )
+    })
+}
+
+fn solve_state_parallel<'alloc>(
+    seed_state: ReducedState,
+    context: &StepLbSolverContext<'alloc>,
+    solved_states: &mut SolvedStates<'alloc>,
+) -> Result<&'alloc ParetoFront, SolverException> {
+    let mut unsolved_states = {
+        let has_solution = |state| solved_states.contains_key(&state);
+        discover_unsolved_states(seed_state, &context.settings, has_solution)
+    };
+    unsolved_states.par_sort_unstable_by_key(|state| state.steps_budget);
+    let mut idx_begin = 0;
+    let mut idx_end = 0;
+    while idx_begin < unsolved_states.len() {
+        let current_step_budget = unsolved_states[idx_begin].steps_budget;
+        while idx_end < unsolved_states.len()
+            && unsolved_states[idx_end].steps_budget == current_step_budget
+        {
+            idx_end += 1;
+        }
+        let current_batch = &unsolved_states[idx_begin..idx_end];
+        let current_batch_solutions = {
+            let get_solution = |state| solved_states.get(&state).copied();
+            current_batch
+                .par_iter()
+                .map_init(
+                    || (ParetoFrontBuilder::new(), context.allocator.get()),
+                    |(pf_builder, allocator), state| -> Result<_, SolverException> {
+                        let solution = construct_solution(
+                            *state,
+                            context,
+                            pf_builder,
+                            get_solution,
+                            allocator,
+                        )?;
+                        Ok((*state, solution))
+                    },
+                )
+                .collect::<Result<Vec<_>, SolverException>>()?
+        };
+        solved_states.extend(current_batch_solutions);
+        idx_begin = idx_end;
+    }
+    solved_states.get(&seed_state).copied().ok_or_else(|| {
+        internal_error!(
+            "State not found in memoization table after solving.",
+            context.settings,
+            seed_state
+        )
+    })
 }

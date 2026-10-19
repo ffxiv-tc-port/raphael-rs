@@ -2,13 +2,17 @@
 target = "wasm32-unknown-unknown"
 
 [target.wasm32-unknown-unknown]
-# web_sys unstable APIs needed for copy to clipboard functionality
 rustflags = [
-    "--cfg=web_sys_unstable_apis",
-    "-C",
-    "target-feature=+atomics,+bulk-memory",
-    "-C",
-    "link-arg=--max-memory=4294967296",
+    "--cfg=web_sys_unstable_apis", # needed for copy-to-clipboard functionality
+    "-Ctarget-feature=+atomics,+bulk-memory,+simd128",
+    "-Clink-arg=--max-memory=4294967296",
+    "-Clink-arg=--shared-memory",
+    "-Clink-arg=--import-memory",
+    "-Clink-arg=--export=__wasm_init_tls",
+    "-Clink-arg=--export=__tls_size",
+    "-Clink-arg=--export=__tls_align",
+    "-Clink-arg=--export=__tls_base",
+    "-Clink-arg=--export=__heap_base",
 ]
 
 [unstable]

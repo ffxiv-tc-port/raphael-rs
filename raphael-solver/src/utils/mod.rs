@@ -34,59 +34,10 @@ impl Drop for ScopedTimer {
     }
 }
 
-struct Entry<T> {
-    item: T,
-    depth: u8,
-    parent_index: usize,
-}
-
-pub struct Backtracking<T: Copy> {
-    entries: Vec<Entry<T>>,
-}
-
-impl<T: Copy> Backtracking<T> {
-    pub const SENTINEL: usize = usize::MAX;
-
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    pub fn get_items(&self, mut index: usize) -> impl Iterator<Item = T> {
-        let mut items = Vec::new();
-        while index != Self::SENTINEL {
-            items.push(self.entries[index].item);
-            index = self.entries[index].parent_index;
-        }
-        items.into_iter().rev()
-    }
-
-    pub fn push(&mut self, item: T, parent_index: usize) -> usize {
-        let depth = if parent_index == Self::SENTINEL {
-            1
-        } else {
-            self.entries[parent_index].depth + 1
-        };
-        self.entries.push(Entry {
-            item,
-            depth,
-            parent_index,
-        });
-        self.entries.len() - 1
-    }
-}
-
-impl<T: Copy> Drop for Backtracking<T> {
-    fn drop(&mut self) {
-        log::debug!("Backtracking - nodes: {}", self.entries.len());
-    }
-}
-
 /// The only way to increase the InnerQuiet effect is to use Quality-increasing actions,
 /// which means that all states with InnerQuiet must have some amount of Quality.
 /// This function finds a lower-bound on the minimum amount of Quality a state with `n` InnerQuiet can have.
-pub fn compute_iq_quality_lut(settings: &SolverSettings) -> [u32; 11] {
+pub fn compute_iq_quality_lut(settings: &SolverSettings) -> [u16; 11] {
     if settings.simulator_settings.adversarial {
         // TODO: implement this for adversarial mode
         return [0; 11];
@@ -98,7 +49,7 @@ pub fn compute_iq_quality_lut(settings: &SolverSettings) -> [u32; 11] {
         // TODO: implement this for heart and soul
         return [0; 11];
     }
-    let mut result = [u32::MAX; 11];
+    let mut result = [u16::MAX; 11];
     result[0] = 0;
     for iq in 0..10 {
         let state = SimulationState {
@@ -108,11 +59,10 @@ pub fn compute_iq_quality_lut(settings: &SolverSettings) -> [u32; 11] {
             quality: 0,
             unreliable_quality: 0,
             effects: Effects::new()
-                .with_allow_quality_actions(true)
-                .with_adversarial_guard(true)
+                .with_special_quality_state(SpecialQualityState::AdversarialGuard)
                 .with_inner_quiet(iq),
         };
-        for &action in FULL_SEARCH_ACTIONS {
+        for action in FULL_SEARCH_ACTIONS {
             if let Ok(new_state) = use_action_combo(settings, state, action) {
                 let new_iq = new_state.effects.inner_quiet();
                 if new_iq > iq {
@@ -128,16 +78,37 @@ pub fn compute_iq_quality_lut(settings: &SolverSettings) -> [u32; 11] {
     result
 }
 
-pub fn largest_single_action_progress_increase(settings: &SolverSettings) -> u32 {
-    let state = SimulationState::new(&settings.simulator_settings);
-    assert_eq!(state.progress, 0);
-    FULL_SEARCH_ACTIONS
-        .iter()
-        .filter_map(|&action| {
-            use_action_combo(settings, state, action)
-                .ok()
-                .map(|state| state.progress)
-        })
-        .max()
-        .unwrap()
+/// Returns the maximum additional Progress gained by having the Muscle Memory effect.
+pub fn maximum_muscle_memory_utilization(settings: &Settings) -> u16 {
+    let mut state = SimulationState::new(settings);
+    let mut result = 0;
+    if settings.is_action_allowed::<BasicSynthesis>() {
+        result = result.max(BasicSynthesis::progress_increase(&state, settings));
+    }
+    if settings.is_action_allowed::<CarefulSynthesis>() {
+        result = result.max(CarefulSynthesis::progress_increase(&state, settings));
+    }
+    if settings.is_action_allowed::<Groundwork>() {
+        // Prevent Groundwork efficiency from halving in very-low durability settings.
+        state.effects.set_trained_perfection_active(true);
+        result = result.max(Groundwork::progress_increase(&state, settings));
+    }
+    if settings.is_action_allowed::<PrudentSynthesis>() {
+        result = result.max(PrudentSynthesis::progress_increase(&state, settings));
+    }
+    if settings.is_action_allowed::<DelicateSynthesis>() {
+        result = result.max(DelicateSynthesis::progress_increase(&state, settings));
+    }
+    if settings.is_action_allowed::<HeartAndSoul>()
+        && settings.is_action_allowed::<IntensiveSynthesis>()
+    {
+        result = result.max(IntensiveSynthesis::progress_increase(&state, settings));
+    }
+    if settings.stellar_steady_hand_charges != 0
+        && settings.is_action_allowed::<StellarSteadyHand>()
+        && settings.is_action_allowed::<RapidSynthesis>()
+    {
+        result = result.max(RapidSynthesis::progress_increase(&state, settings));
+    }
+    result
 }

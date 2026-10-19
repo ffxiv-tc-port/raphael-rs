@@ -1,4 +1,4 @@
-use crate::ITEMS;
+use crate::{CL_ICON_CHAR, CosmicExplorationZone, HQ_ICON_CHAR, ITEMS, NciArray, nci_array};
 use raphael_sim::Action;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -8,59 +8,188 @@ pub enum Locale {
     DE,
     FR,
     JP,
+    CN,
     KR,
+    TW,
 }
 
-impl std::fmt::Display for Locale {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Locale {
+    pub fn short_code(self) -> &'static str {
         match self {
-            Self::EN => write!(f, "EN"),
-            Self::DE => write!(f, "DE"),
-            Self::FR => write!(f, "FR"),
-            Self::JP => write!(f, "JP"),
-            Self::KR => write!(f, "KR"),
+            Self::EN => "EN",
+            Self::DE => "DE",
+            Self::FR => "FR",
+            Self::JP => "JP",
+            Self::CN => "CN",
+            Self::KR => "KR",
+            Self::TW => "TW",
         }
     }
 }
 
-const JOB_NAMES_EN: [&str; 8] = ["CRP", "BSM", "ARM", "GSM", "LTW", "WVR", "ALC", "CUL"];
-const JOB_NAMES_DE: [&str; 8] = ["ZMR", "GRS", "PLA", "GLD", "GER", "WEB", "ALC", "GRM"];
-const JOB_NAMES_FR: [&str; 8] = ["MEN", "FRG", "ARM", "ORF", "TAN", "COU", "ALC", "CUI"];
-const JOB_NAMES_KR: [&str; 8] = ["목수", "대장", "갑주", "보석", "가죽", "재봉", "연금", "요리"];
+pub const JOB_NAMES_EN: [&str; 8] = ["CRP", "BSM", "ARM", "GSM", "LTW", "WVR", "ALC", "CUL"];
+pub const JOB_NAMES_DE: [&str; 8] = ["ZMR", "GRS", "PLA", "GLD", "GER", "WEB", "ALC", "GRM"];
+pub const JOB_NAMES_FR: [&str; 8] = ["MEN", "FRG", "ARM", "ORF", "TAN", "COU", "ALC", "CUI"];
+pub const JOB_NAMES_JP: [&str; 8] = [
+    "木工師",
+    "鍛冶師",
+    "甲冑師",
+    "彫金師",
+    "革細工師",
+    "裁縫師",
+    "錬金術師",
+    "調理師",
+];
+pub const JOB_NAMES_CN: [&str; 8] = [
+    "刻木", "锻铁", "铸甲", "雕金", "制革", "裁衣", "炼金", "烹调",
+];
+pub const JOB_NAMES_KR: [&str; 8] = [
+    "목수", "대장", "갑주", "보석", "가죽", "재봉", "연금", "요리",
+];
+pub const JOB_NAMES_TW: [&str; 8] = [
+    "木工", "鍛造", "甲冑", "金工", "皮革", "裁縫", "鍊金", "烹調",
+];
 
 pub fn get_job_name(job_id: u8, locale: Locale) -> &'static str {
     match locale {
         Locale::EN => JOB_NAMES_EN[job_id as usize],
         Locale::DE => JOB_NAMES_DE[job_id as usize],
         Locale::FR => JOB_NAMES_FR[job_id as usize],
-        Locale::JP => JOB_NAMES_EN[job_id as usize], // JP job abbreviations are the same as EN
+        Locale::JP => JOB_NAMES_JP[job_id as usize],
+        Locale::CN => JOB_NAMES_CN[job_id as usize],
         Locale::KR => JOB_NAMES_KR[job_id as usize],
+        Locale::TW => JOB_NAMES_TW[job_id as usize],
     }
 }
 
-pub static ITEM_NAMES_EN: phf::Map<u32, &str> = include!("../data/item_names_en.rs");
-pub static ITEM_NAMES_DE: phf::Map<u32, &str> = include!("../data/item_names_de.rs");
-pub static ITEM_NAMES_FR: phf::Map<u32, &str> = include!("../data/item_names_fr.rs");
-pub static ITEM_NAMES_JP: phf::Map<u32, &str> = include!("../data/item_names_jp.rs");
-pub static ITEM_NAMES_KR: phf::Map<u32, &str> = include!("../data/item_names_kr.rs");
+pub fn get_job_id(job_name: &str, locale: Locale) -> Option<u8> {
+    let job_names = match locale {
+        Locale::EN => JOB_NAMES_EN,
+        Locale::DE => JOB_NAMES_DE,
+        Locale::FR => JOB_NAMES_FR,
+        Locale::JP => JOB_NAMES_JP,
+        Locale::CN => JOB_NAMES_CN,
+        Locale::KR => JOB_NAMES_KR,
+        Locale::TW => JOB_NAMES_TW,
+    };
+    job_names
+        .iter()
+        .position(|&name| name == job_name)
+        .map(|i| i as u8)
+}
+
+pub fn get_cosmic_exploration_zone_name(
+    zone: CosmicExplorationZone,
+    locale: Locale,
+) -> &'static str {
+    match locale {
+        Locale::EN | Locale::DE | Locale::FR => cosmic_exploration_zone_name_latin_characters(zone),
+        Locale::JP => cosmic_exploration_zone_jp(zone),
+        Locale::CN => cosmic_exploration_zone_cn(zone),
+        Locale::KR => cosmic_exploration_zone_kr(zone),
+        Locale::TW => cosmic_exploration_zone_tw(zone),
+    }
+}
+
+fn cosmic_exploration_zone_name_latin_characters(zone: CosmicExplorationZone) -> &'static str {
+    match zone {
+        CosmicExplorationZone::SinusArdorum => "Sinus Ardorum",
+        CosmicExplorationZone::Phaenna => "Phaenna",
+        CosmicExplorationZone::Oizys => "Oizys",
+        CosmicExplorationZone::Auxesia => "Auxesia",
+    }
+}
+
+fn cosmic_exploration_zone_jp(zone: CosmicExplorationZone) -> &'static str {
+    match zone {
+        CosmicExplorationZone::SinusArdorum => "焦がれの入江",
+        CosmicExplorationZone::Phaenna => "惑星パエンナ",
+        CosmicExplorationZone::Oizys => "惑星オイジュス",
+        CosmicExplorationZone::Auxesia => "惑星アウクセシア",
+    }
+}
+
+fn cosmic_exploration_zone_cn(zone: CosmicExplorationZone) -> &'static str {
+    match zone {
+        CosmicExplorationZone::SinusArdorum => "憧憬湾",
+        CosmicExplorationZone::Phaenna => "法恩娜行星",
+        CosmicExplorationZone::Oizys => "俄匊斯行星",
+        CosmicExplorationZone::Auxesia => "奥克塞西亚行星",
+    }
+}
+
+fn cosmic_exploration_zone_kr(zone: CosmicExplorationZone) -> &'static str {
+    match zone {
+        CosmicExplorationZone::SinusArdorum => "동경의 만",
+        CosmicExplorationZone::Phaenna => "행성 파엔나",
+        CosmicExplorationZone::Oizys => "행성 오이지스",
+        CosmicExplorationZone::Auxesia => "행성 아욱세시아",
+    }
+}
+
+fn cosmic_exploration_zone_tw(zone: CosmicExplorationZone) -> &'static str {
+    match zone {
+        CosmicExplorationZone::SinusArdorum => "渴望灣",
+        // Rest will be added in TW version's 7.3, 7.4 & 7.5
+        _ => cosmic_exploration_zone_name_latin_characters(zone),
+    }
+}
+
+pub const ITEM_NAMES_EN: NciArray<u32, &str> = include!("../data/item_names_en.rs");
+pub const ITEM_NAMES_DE: NciArray<u32, &str> = include!("../data/item_names_de.rs");
+pub const ITEM_NAMES_FR: NciArray<u32, &str> = include!("../data/item_names_fr.rs");
+pub const ITEM_NAMES_JP: NciArray<u32, &str> = include!("../data/item_names_jp.rs");
+pub const ITEM_NAMES_CN: NciArray<u32, &str> = include!("../data/item_names_cn.rs");
+pub const ITEM_NAMES_KR: NciArray<u32, &str> = include!("../data/item_names_kr.rs");
+pub const ITEM_NAMES_TW: NciArray<u32, &str> = include!("../data/item_names_tw.rs");
+
+pub fn get_raw_item_name(item_id: u32, locale: Locale) -> Option<&'static str> {
+    match locale {
+        Locale::EN => ITEM_NAMES_EN.get(item_id).copied(),
+        Locale::DE => ITEM_NAMES_DE.get(item_id).copied(),
+        Locale::FR => ITEM_NAMES_FR.get(item_id).copied(),
+        Locale::JP => ITEM_NAMES_JP.get(item_id).copied(),
+        Locale::CN => ITEM_NAMES_CN.get(item_id).copied(),
+        Locale::KR => ITEM_NAMES_KR.get(item_id).copied(),
+        Locale::TW => ITEM_NAMES_TW.get(item_id).copied(),
+    }
+}
 
 pub fn get_item_name(item_id: u32, hq: bool, locale: Locale) -> Option<String> {
-    let item_name = match locale {
-        Locale::EN => ITEM_NAMES_EN.get(&item_id)?.to_owned(),
-        Locale::DE => ITEM_NAMES_DE.get(&item_id)?.to_owned(),
-        Locale::FR => ITEM_NAMES_FR.get(&item_id)?.to_owned(),
-        Locale::JP => ITEM_NAMES_JP.get(&item_id)?.to_owned(),
-        Locale::KR => ITEM_NAMES_KR.get(&item_id)?.to_owned(),
-    };
-    let item_entry = ITEMS.get(&item_id);
-    let always_collectable = item_entry.is_some_and(|item| item.always_collectable);
-    if !always_collectable {
-        match hq {
-            true => Some(format!("{} \u{e03c}", item_name)),
-            false => Some(item_name.to_string()),
-        }
+    let raw_item_name = get_raw_item_name(item_id, locale)?;
+    if ITEMS.get(item_id)?.always_collectable {
+        Some(format!("{} {}", raw_item_name, CL_ICON_CHAR))
+    } else if hq {
+        Some(format!("{} {}", raw_item_name, HQ_ICON_CHAR))
     } else {
-        Some(format!("{} \u{e03d}", item_name))
+        Some(raw_item_name.into())
+    }
+}
+
+pub static STELLAR_MISSION_NAMES_EN: NciArray<u32, &str> =
+    include!("../data/stellar_mission_names_en.rs");
+pub static STELLAR_MISSION_NAMES_DE: NciArray<u32, &str> =
+    include!("../data/stellar_mission_names_de.rs");
+pub static STELLAR_MISSION_NAMES_FR: NciArray<u32, &str> =
+    include!("../data/stellar_mission_names_fr.rs");
+pub static STELLAR_MISSION_NAMES_JP: NciArray<u32, &str> =
+    include!("../data/stellar_mission_names_jp.rs");
+pub static STELLAR_MISSION_NAMES_CN: NciArray<u32, &str> =
+    include!("../data/stellar_mission_names_cn.rs");
+pub static STELLAR_MISSION_NAMES_KR: NciArray<u32, &str> =
+    include!("../data/stellar_mission_names_kr.rs");
+pub static STELLAR_MISSION_NAMES_TW: NciArray<u32, &str> =
+    include!("../data/stellar_mission_names_tw.rs");
+
+pub fn get_stellar_mission_name(mission_id: u32, locale: Locale) -> Option<&'static str> {
+    match locale {
+        Locale::EN => STELLAR_MISSION_NAMES_EN.get(mission_id).copied(),
+        Locale::DE => STELLAR_MISSION_NAMES_DE.get(mission_id).copied(),
+        Locale::FR => STELLAR_MISSION_NAMES_FR.get(mission_id).copied(),
+        Locale::JP => STELLAR_MISSION_NAMES_JP.get(mission_id).copied(),
+        Locale::CN => STELLAR_MISSION_NAMES_CN.get(mission_id).copied(),
+        Locale::KR => STELLAR_MISSION_NAMES_KR.get(mission_id).copied(),
+        Locale::TW => STELLAR_MISSION_NAMES_TW.get(mission_id).copied(),
     }
 }
 
@@ -70,7 +199,29 @@ pub const fn action_name(action: Action, locale: Locale) -> &'static str {
         Locale::DE => action_name_de(action),
         Locale::FR => action_name_fr(action),
         Locale::JP => action_name_jp(action),
+        Locale::CN => action_name_cn(action),
         Locale::KR => action_name_kr(action),
+        Locale::TW => action_name_tw(action),
+    }
+}
+
+/// Returns the name of an action to be used in macros.
+/// The macro name for an action may be different from its normal display name.
+pub const fn macro_name(action: Action, locale: Locale) -> &'static str {
+    match action {
+        Action::StellarSteadyHand => match locale {
+            Locale::EN => "Duty Action II",
+            Locale::DE => "Spezialkommando 2",
+            Locale::FR => "Action de mission 2",
+            Locale::JP => "コンテンツアクション2",
+            Locale::CN => "任务指令2",
+            Locale::KR => "임무용 기술 2",
+            Locale::TW => "任務指令2",
+        },
+        // Hasty Touch turns into Daring Touch while under the effect of Expedience.
+        Action::DaringTouch => action_name(Action::HastyTouch, locale),
+        // Use the normal action display name for other actions.
+        _ => action_name(action, locale),
     }
 }
 
@@ -107,6 +258,10 @@ const fn action_name_en(action: Action) -> &'static str {
         Action::TrainedPerfection => "Trained Perfection",
         Action::TrainedEye => "Trained Eye",
         Action::QuickInnovation => "Quick Innovation",
+        Action::StellarSteadyHand => "Stellar Steady Hand",
+        Action::RapidSynthesis => "Rapid Synthesis",
+        Action::HastyTouch => "Hasty Touch",
+        Action::DaringTouch => "Daring Touch",
     }
 }
 
@@ -143,6 +298,10 @@ const fn action_name_de(action: Action) -> &'static str {
         Action::TrainedPerfection => "Meisters Beitrag",
         Action::TrainedEye => "Flinke Hand",
         Action::QuickInnovation => "Spontane Innovation",
+        Action::StellarSteadyHand => "Kosmo-Ruhige Hand",
+        Action::RapidSynthesis => "Schnelle Bearbeitung",
+        Action::HastyTouch => "Hastige Veredelung",
+        Action::DaringTouch => "Kühne Veredelung",
     }
 }
 
@@ -179,6 +338,10 @@ const fn action_name_fr(action: Action) -> &'static str {
         Action::TrainedPerfection => "Main suprême",
         Action::TrainedEye => "Main preste",
         Action::QuickInnovation => "Innovation instantanée",
+        Action::StellarSteadyHand => "Cosmomain sûre",
+        Action::RapidSynthesis => "Travail rapide",
+        Action::HastyTouch => "Ouvrage hâtif",
+        Action::DaringTouch => "Ouvrage audacieux",
     }
 }
 
@@ -215,6 +378,50 @@ const fn action_name_jp(action: Action) -> &'static str {
         Action::TrainedPerfection => "匠の絶技",
         Action::TrainedEye => "匠の早業",
         Action::QuickInnovation => "クイックイノベーション",
+        Action::StellarSteadyHand => "コスモステディハンド",
+        Action::RapidSynthesis => "突貫作業",
+        Action::HastyTouch => "ヘイスティタッチ",
+        Action::DaringTouch => "デアリングタッチ",
+    }
+}
+
+const fn action_name_cn(action: Action) -> &'static str {
+    match action {
+        Action::BasicSynthesis => "制作",
+        Action::BasicTouch => "加工",
+        Action::MasterMend => "精修",
+        Action::Observe => "观察",
+        Action::TricksOfTheTrade => "秘诀",
+        Action::WasteNot => "俭约",
+        Action::Veneration => "崇敬",
+        Action::StandardTouch => "中级加工",
+        Action::GreatStrides => "阔步",
+        Action::Innovation => "改革",
+        Action::WasteNot2 => "长期俭约",
+        Action::ByregotsBlessing => "比尔格的祝福",
+        Action::PreciseTouch => "集中加工",
+        Action::MuscleMemory => "坚信",
+        Action::CarefulSynthesis => "模范制作",
+        Action::Manipulation => "掌握",
+        Action::PrudentTouch => "俭约加工",
+        Action::AdvancedTouch => "上级加工",
+        Action::Reflect => "闲静",
+        Action::PreparatoryTouch => "坯料加工",
+        Action::Groundwork => "坯料制作",
+        Action::DelicateSynthesis => "精密制作",
+        Action::IntensiveSynthesis => "集中制作",
+        Action::HeartAndSoul => "专心致志",
+        Action::PrudentSynthesis => "俭约制作",
+        Action::TrainedFinesse => "工匠的神技",
+        Action::RefinedTouch => "精炼加工",
+        Action::ImmaculateMend => "巧夺天工",
+        Action::TrainedPerfection => "工匠的绝技",
+        Action::TrainedEye => "工匠的神速技巧",
+        Action::QuickInnovation => "快速改革",
+        Action::StellarSteadyHand => "宇宙稳手",
+        Action::RapidSynthesis => "高速制作",
+        Action::HastyTouch => "仓促",
+        Action::DaringTouch => "冒进",
     }
 }
 
@@ -251,5 +458,49 @@ const fn action_name_kr(action: Action) -> &'static str {
         Action::TrainedPerfection => "장인의 초절 기술",
         Action::TrainedEye => "장인의 날랜손",
         Action::QuickInnovation => "신속한 혁신",
+        Action::StellarSteadyHand => "우주 안정된 솜씨",
+        Action::RapidSynthesis => "강행 작업",
+        Action::HastyTouch => "성급한 손길",
+        Action::DaringTouch => "대담한 손길",
+    }
+}
+
+const fn action_name_tw(action: Action) -> &'static str {
+    match action {
+        Action::BasicSynthesis => "製作",
+        Action::BasicTouch => "加工",
+        Action::MasterMend => "精修",
+        Action::Observe => "觀察",
+        Action::TricksOfTheTrade => "秘訣",
+        Action::WasteNot => "儉約",
+        Action::Veneration => "崇敬",
+        Action::StandardTouch => "中級加工",
+        Action::GreatStrides => "闊步",
+        Action::Innovation => "改革",
+        Action::WasteNot2 => "長期儉約",
+        Action::ByregotsBlessing => "比爾格的祝福",
+        Action::PreciseTouch => "集中加工",
+        Action::MuscleMemory => "堅信",
+        Action::CarefulSynthesis => "模範製作",
+        Action::Manipulation => "掌握",
+        Action::PrudentTouch => "儉約加工",
+        Action::AdvancedTouch => "上級加工",
+        Action::Reflect => "閒靜",
+        Action::PreparatoryTouch => "坯料加工",
+        Action::Groundwork => "坯料製作",
+        Action::DelicateSynthesis => "精密製作",
+        Action::IntensiveSynthesis => "集中製作",
+        Action::HeartAndSoul => "專心致志",
+        Action::PrudentSynthesis => "儉約製作",
+        Action::TrainedFinesse => "工匠的神技",
+        Action::RefinedTouch => "精煉加工",
+        Action::ImmaculateMend => "巧奪天工",
+        Action::TrainedPerfection => "工匠的絕技",
+        Action::TrainedEye => "工匠的神速技巧",
+        Action::QuickInnovation => "快速改革",
+        Action::StellarSteadyHand => "Stellar Steady Hand",
+        Action::RapidSynthesis => "高速製作",
+        Action::HastyTouch => "倉促",
+        Action::DaringTouch => "冒進",
     }
 }

@@ -6,9 +6,9 @@ use crate::{Condition, Settings};
 pub struct SimulationState {
     pub cp: u16,
     pub durability: u16,
-    pub progress: u32,
-    pub quality: u32,            // previous unguarded action = Poor
-    pub unreliable_quality: u32, // previous unguarded action = Normal, diff with quality
+    pub progress: u16,
+    pub quality: u16,            // previous unguarded action = Poor
+    pub unreliable_quality: u16, // previous unguarded action = Normal, diff with quality
     pub effects: Effects,
 }
 
@@ -24,7 +24,7 @@ impl SimulationState {
         }
     }
 
-    pub fn from_macro(settings: &Settings, actions: &[Action]) -> Result<Self, &'static str> {
+    pub fn from_macro(settings: &Settings, actions: &[Action]) -> Result<Self, ActionError> {
         let mut state = Self::new(settings);
         for action in actions {
             state = state.use_action(*action, Condition::Normal, settings)?;
@@ -35,7 +35,7 @@ impl SimulationState {
     pub fn from_macro_continue_on_error(
         settings: &Settings,
         actions: &[Action],
-    ) -> (Self, Vec<Result<(), &'static str>>) {
+    ) -> (Self, Vec<Result<(), ActionError>>) {
         let mut state = Self::new(settings);
         let mut errors = Vec::new();
         for action in actions {
@@ -54,22 +54,22 @@ impl SimulationState {
     }
 
     pub fn is_final(&self, settings: &Settings) -> bool {
-        self.durability == 0 || self.progress >= u32::from(settings.max_progress)
+        self.durability == 0 || self.progress >= settings.max_progress
     }
 
     fn check_common_preconditions<A: ActionImpl>(
         &self,
         settings: &Settings,
         condition: Condition,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), ActionError> {
         if settings.job_level < A::LEVEL_REQUIREMENT {
-            Err("Level not high enough")
+            Err(ActionError::InsufficientLevels)
         } else if !settings.allowed_actions.has_mask(A::ACTION_MASK) {
-            Err("Action disabled by action mask")
+            Err(ActionError::Disabled)
         } else if self.is_final(settings) {
-            Err("State is final")
+            Err(ActionError::StateIsFinal)
         } else if A::cp_cost(self, settings, condition) > self.cp {
-            Err("Not enough CP")
+            Err(ActionError::InsufficientCP)
         } else {
             Ok(())
         }
@@ -79,88 +79,86 @@ impl SimulationState {
         &self,
         settings: &Settings,
         condition: Condition,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, ActionError> {
         self.check_common_preconditions::<A>(settings, condition)?;
         A::precondition(self, settings, condition)?;
 
         let mut state = *self;
 
-        A::transform_pre(&mut state, settings, condition);
-
         if A::base_durability_cost(&state, settings) != 0 {
             state.durability = state
                 .durability
                 .saturating_sub(A::durability_cost(self, settings, condition));
-            state.effects.set_trained_perfection_active(false);
         }
 
         state.cp -= A::cp_cost(self, settings, condition);
 
         let quality_increase = A::quality_increase(self, settings, condition);
-        if !state.effects.allow_quality_actions() && quality_increase != 0 {
-            return Err("Forbidden by backload_progress setting");
-        }
         if settings.adversarial {
-            let adversarial_quality_increase = if state.effects.adversarial_guard() {
-                quality_increase
-            } else {
-                A::quality_increase(self, settings, Condition::Poor)
-            };
-            if !state.effects.adversarial_guard() && adversarial_quality_increase == 0 {
+            let guard_active = state.effects.adversarial_guard_active();
+            if quality_increase != 0 {
+                if guard_active {
+                    state.quality = state.quality.saturating_add(quality_increase);
+                    state.unreliable_quality = 0;
+                } else {
+                    let adversarial_quality_increase =
+                        A::quality_increase(self, settings, Condition::Poor);
+                    let quality_diff = quality_increase - adversarial_quality_increase;
+                    state.quality = state
+                        .quality
+                        .saturating_add(adversarial_quality_increase)
+                        .saturating_add(std::cmp::min(state.unreliable_quality, quality_diff));
+                    state.unreliable_quality =
+                        quality_diff.saturating_sub(state.unreliable_quality);
+                }
+            } else if A::INCREASES_STEP_COUNT && !guard_active {
                 state.unreliable_quality = 0;
-            } else if state.effects.adversarial_guard() && adversarial_quality_increase != 0 {
-                state.quality += adversarial_quality_increase;
-                state.unreliable_quality = 0;
-            } else if adversarial_quality_increase != 0 {
-                let quality_diff = quality_increase - adversarial_quality_increase;
-                state.quality += adversarial_quality_increase
-                    + std::cmp::min(state.unreliable_quality, quality_diff);
-                state.unreliable_quality = quality_diff.saturating_sub(state.unreliable_quality);
             }
         } else {
-            state.quality += quality_increase;
+            state.quality = state.quality.saturating_add(quality_increase);
         }
         if quality_increase != 0 && settings.job_level >= 11 {
-            state.effects.set_great_strides(0);
             state
                 .effects
                 .set_inner_quiet(std::cmp::min(10, state.effects.inner_quiet() + 1));
         }
 
-        let progress_increase = A::progress_increase(self, settings, condition);
-        state.progress += progress_increase;
-        if progress_increase != 0 && state.effects.muscle_memory() != 0 {
-            state.effects.set_muscle_memory(0);
-        }
-
-        if progress_increase != 0 && settings.backload_progress {
-            state.effects.set_allow_quality_actions(false);
-        }
+        let progress_increase = A::progress_increase(self, settings);
+        state.progress = state.progress.saturating_add(progress_increase);
 
         if state.is_final(settings) {
             return Ok(state);
         }
 
-        if A::TICK_EFFECTS {
+        let is_synthesis_begin = state.effects.combo() == Combo::SynthesisBegin;
+        state.effects =
+            Effects::from_bits(state.effects.into_bits() & A::EFFECT_RESET_MASK.into_bits());
+        if !A::INCREASES_STEP_COUNT && is_synthesis_begin {
+            // SynthesisBegin is implemented as a combo but it is in reality not a combo.
+            // Actions that require the SynthesisBegin "combo" actually check the step count,
+            // which does not increase when using actions such as QuickInnovation.
+            state.effects.set_combo(Combo::SynthesisBegin);
+        }
+
+        if A::INCREASES_STEP_COUNT {
             if state.effects.manipulation() != 0 {
                 state.durability = std::cmp::min(settings.max_durability, state.durability + 5);
             }
             state.effects = state.effects.tick_down();
         }
 
-        if settings.adversarial && quality_increase != 0 {
-            state.effects.set_adversarial_guard(true);
-        }
+        A::transform(&mut state, settings, condition);
 
-        A::transform_post(&mut state, settings, condition);
+        state.effects =
+            Effects::from_bits(state.effects.into_bits() | A::EFFECT_SET_MASK.into_bits());
 
-        state
-            .effects
-            .set_combo(A::combo(&state, settings, condition));
-
-        if !state.effects.allow_quality_actions() {
-            state.unreliable_quality = 0;
+        if progress_increase != 0 && settings.backload_progress {
             state.effects = state.effects.strip_quality_effects();
+            state.unreliable_quality = 0;
+        } else if settings.adversarial && quality_increase != 0 {
+            state
+                .effects
+                .set_special_quality_state(SpecialQualityState::AdversarialGuard);
         }
 
         Ok(state)
@@ -171,7 +169,7 @@ impl SimulationState {
         action: Action,
         condition: Condition,
         settings: &Settings,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, ActionError> {
         match action {
             Action::BasicSynthesis => self.use_action_impl::<BasicSynthesis>(settings, condition),
             Action::BasicTouch => self.use_action_impl::<BasicTouch>(settings, condition),
@@ -220,6 +218,12 @@ impl SimulationState {
             Action::TrainedPerfection => {
                 self.use_action_impl::<TrainedPerfection>(settings, condition)
             }
+            Action::StellarSteadyHand => {
+                self.use_action_impl::<StellarSteadyHand>(settings, condition)
+            }
+            Action::RapidSynthesis => self.use_action_impl::<RapidSynthesis>(settings, condition),
+            Action::HastyTouch => self.use_action_impl::<HastyTouch>(settings, condition),
+            Action::DaringTouch => self.use_action_impl::<DaringTouch>(settings, condition),
         }
     }
 }

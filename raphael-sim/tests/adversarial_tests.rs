@@ -1,4 +1,4 @@
-use raphael_sim::{Action, ActionMask, Condition, Settings, SimulationState};
+use raphael_sim::{Action, ActionError, ActionMask, Condition, Settings, SimulationState};
 const SETTINGS: Settings = Settings {
     max_cp: 1000,
     max_durability: 80,
@@ -10,10 +10,11 @@ const SETTINGS: Settings = Settings {
     allowed_actions: ActionMask::all(),
     adversarial: true,
     backload_progress: false,
+    stellar_steady_hand_charges: 0,
 };
 
 /// Calculate the minimum achievable Quality across all possible Condition rolls
-fn guaranteed_quality(mut settings: Settings, actions: &[Action]) -> Result<u32, &'static str> {
+fn guaranteed_quality(mut settings: Settings, actions: &[Action]) -> Result<u16, ActionError> {
     let is_valid_mask = |mut mask: i32| {
         // a 1-bit denotes an Excellent proc
         if (mask & 1) != 0 {
@@ -30,24 +31,35 @@ fn guaranteed_quality(mut settings: Settings, actions: &[Action]) -> Result<u32,
         }
         true
     };
+    let action_rerolls_condition =
+        |action: &Action| *action != Action::QuickInnovation && *action != Action::HeartAndSoul;
 
     settings.adversarial = false;
-    let mut min_quality = u32::MAX;
+    let mut min_quality = u16::MAX;
 
-    for mask in 0..(1 << actions.len()) {
+    let condition_mask_len = actions
+        .iter()
+        .copied()
+        .filter(action_rerolls_condition)
+        .count();
+    for mask in 0..(1 << condition_mask_len) {
         if !is_valid_mask(mask) {
             continue;
         }
         let mut state = SimulationState::new(&settings);
-        for (index, action) in actions.iter().enumerate() {
-            let condition = if ((mask >> index) & 1) == 1 {
+        let mut condition_mask_idx = 0;
+        for action in actions {
+            let condition = if ((mask >> condition_mask_idx) & 1) == 1 {
                 Condition::Excellent
-            } else if index == 0 || ((mask >> (index - 1)) & 1) == 0 {
+            } else if condition_mask_idx == 0 || ((mask >> (condition_mask_idx - 1)) & 1) == 0 {
                 Condition::Normal
             } else {
                 Condition::Poor
             };
             state = state.use_action(*action, condition, &settings)?;
+            if action_rerolls_condition(action) {
+                condition_mask_idx += 1;
+            }
         }
         min_quality = std::cmp::min(min_quality, state.quality);
     }
@@ -62,25 +74,17 @@ fn test_simple() {
         Action::PreparatoryTouch,
         Action::BasicSynthesis,
     ];
-    let state = SimulationState::from_macro(&SETTINGS, &actions);
-    if let Ok(state) = state {
-        assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 100);
-        assert_eq!(state.quality, 100);
-    } else {
-        panic!("Unexpected err: {}", state.err().unwrap());
-    }
+    let state = SimulationState::from_macro(&SETTINGS, &actions).unwrap();
+    assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 100);
+    assert_eq!(state.quality, 100);
 }
 
 #[test]
 fn test_short_quality_opener() {
     let actions = [Action::Reflect];
-    let state = SimulationState::from_macro(&SETTINGS, &actions);
-    if let Ok(state) = state {
-        assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 300);
-        assert_eq!(state.quality, 300);
-    } else {
-        panic!("Unexpected err: {}", state.err().unwrap());
-    }
+    let state = SimulationState::from_macro(&SETTINGS, &actions).unwrap();
+    assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 300);
+    assert_eq!(state.quality, 300);
 }
 
 #[test]
@@ -91,13 +95,9 @@ fn test_long_quality_opener() {
         Action::PreparatoryTouch,
         Action::PreparatoryTouch,
     ];
-    let state = SimulationState::from_macro(&SETTINGS, &actions);
-    if let Ok(state) = state {
-        assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 1140);
-        assert_eq!(state.quality, 1140);
-    } else {
-        panic!("Unexpected err: {}", state.err().unwrap());
-    }
+    let state = SimulationState::from_macro(&SETTINGS, &actions).unwrap();
+    assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 1140);
+    assert_eq!(state.quality, 1140);
 }
 
 #[test]
@@ -111,13 +111,9 @@ fn test_alternating_quality_actions() {
         Action::GreatStrides,
         Action::BasicTouch,
     ];
-    let state = SimulationState::from_macro(&SETTINGS, &actions);
-    if let Ok(state) = state {
-        assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 440);
-        assert_eq!(state.quality, 440);
-    } else {
-        panic!("Unexpected err: {}", state.err().unwrap());
-    }
+    let state = SimulationState::from_macro(&SETTINGS, &actions).unwrap();
+    assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 440);
+    assert_eq!(state.quality, 440);
 }
 
 #[test]
@@ -132,13 +128,9 @@ fn test_double_status_drops() {
         Action::GreatStrides,
         Action::BasicTouch,
     ];
-    let state = SimulationState::from_macro(&SETTINGS, &actions);
-    if let Ok(state) = state {
-        assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 525);
-        assert_eq!(state.quality, 525);
-    } else {
-        panic!("Unexpected err: {}", state.err().unwrap());
-    }
+    let state = SimulationState::from_macro(&SETTINGS, &actions).unwrap();
+    assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 525);
+    assert_eq!(state.quality, 525);
 }
 
 #[test]
@@ -153,13 +145,9 @@ fn test_two_action_drops() {
         Action::GreatStrides,
         Action::BasicTouch,
     ];
-    let state = SimulationState::from_macro(&SETTINGS, &actions);
-    if let Ok(state) = state {
-        assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 607);
-        assert_eq!(state.quality, 607);
-    } else {
-        panic!("Unexpected err: {}", state.err().unwrap());
-    }
+    let state = SimulationState::from_macro(&SETTINGS, &actions).unwrap();
+    assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 607);
+    assert_eq!(state.quality, 607);
 }
 
 #[test]
@@ -175,13 +163,9 @@ fn test_dp() {
         Action::GreatStrides,
         Action::PreparatoryTouch,
     ];
-    let state = SimulationState::from_macro(&SETTINGS, &actions);
-    if let Ok(state) = state {
-        assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 952);
-        assert_eq!(state.quality, 952);
-    } else {
-        panic!("Unexpected err: {}", state.err().unwrap());
-    }
+    let state = SimulationState::from_macro(&SETTINGS, &actions).unwrap();
+    assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 952);
+    assert_eq!(state.quality, 952);
 }
 
 #[test]
@@ -206,13 +190,9 @@ fn test_long_sequence() {
         Action::ByregotsBlessing,
         Action::CarefulSynthesis,
     ];
-    let state = SimulationState::from_macro(&SETTINGS, &actions);
-    if let Ok(state) = state {
-        assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 2924);
-        assert_eq!(state.quality, 2924);
-    } else {
-        panic!("Unexpected err: {}", state.err().unwrap());
-    }
+    let state = SimulationState::from_macro(&SETTINGS, &actions).unwrap();
+    assert_eq!(guaranteed_quality(SETTINGS, &actions).unwrap(), 2924);
+    assert_eq!(state.quality, 2924);
 }
 
 #[test]
@@ -226,16 +206,12 @@ fn test_exhaustive() {
                 _ => Action::PrudentTouch,
             })
             .collect();
-        let state = SimulationState::from_macro(&SETTINGS, &actions);
-        if let Ok(state) = state {
-            dbg!(&actions);
-            assert_eq!(
-                state.quality,
-                guaranteed_quality(SETTINGS, &actions).unwrap()
-            );
-        } else {
-            panic!("Unexpected err: {}", state.err().unwrap());
-        }
+        let state = SimulationState::from_macro(&SETTINGS, &actions).unwrap();
+        dbg!(&actions);
+        assert_eq!(
+            state.quality,
+            guaranteed_quality(SETTINGS, &actions).unwrap()
+        );
     }
 }
 
@@ -243,7 +219,7 @@ fn test_exhaustive() {
 /// Test random quality action sequences
 fn test_fuzz() {
     const STEPS: usize = 10;
-    const ACTIONS: [Action; 9] = [
+    const ACTIONS: [Action; 10] = [
         Action::BasicTouch,
         Action::StandardTouch,
         Action::AdvancedTouch,
@@ -253,6 +229,7 @@ fn test_fuzz() {
         Action::GreatStrides,
         Action::ImmaculateMend,
         Action::TricksOfTheTrade,
+        Action::QuickInnovation,
     ];
     for _ in 0..100000 {
         let actions: Vec<Action> =
